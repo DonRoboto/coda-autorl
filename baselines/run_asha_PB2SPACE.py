@@ -227,7 +227,7 @@ def _save_metadata(
         "fixed_entropy_coeff": FIXED_ENTROPY_COEFF,
         "fixed_vf_loss_coeff": FIXED_VF_LOSS_COEFF,
         "ppo": {
-            "gamma": 0.999,
+            "gamma": 0.99,
             "grad_clip": 0.5,
             "minibatch_size": 512,
             "num_sgd_iter": 10,
@@ -297,7 +297,7 @@ def _build_ppo_config(env_name: str, seed: int) -> PPOConfig:
             use_kl_loss=True,
             kl_coeff=0.2,
             kl_target=0.01,
-            gamma=0.999,
+            gamma=0.99,
             grad_clip=0.5,
             num_sgd_iter=10,
             vf_clip_param=10.0,

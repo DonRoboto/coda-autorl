@@ -1,14 +1,5 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Created on Mon Aug 10 14:47:46 2026
 
-@author: yor5
-"""
 
-from __future__ import annotations
-
-# CPU limits must be set before NumPy / Ray / PyTorch imports.
 import os
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -55,7 +46,7 @@ from w_pb2_experimentos_config import (  # noqa: E402
 
 ALGO_NAME = "PBT"
 
-# Keep these outputs separate while validating the PB2-matched search space.
+# PB2-matched PBT baseline aligned with the current CODA PPO protocol.
 # Set PBT_RUN_TAG="" for canonical final-campaign filenames.
 RUN_TAG = os.environ.get("PBT_RUN_TAG", "PB2SPACE").strip()
 OUTPUT_NAME = f"{ALGO_NAME}_{RUN_TAG}" if RUN_TAG else ALGO_NAME
@@ -71,7 +62,8 @@ HYPERPARAM_BOUNDS = {
     "lr": [1e-5, 1e-3],
 }
 
-# These remain fixed and identical across PBT/PB2/ASHA/CODA.
+# These remain fixed and identical across the external baselines; CODA uses
+# the same vf_loss_coeff while entropy is reserved for its O2I actuator.
 FIXED_VF_LOSS_COEFF = 0.5
 FIXED_ENTROPY_COEFF = 0.0
 
@@ -135,8 +127,183 @@ class PBTDiagnosticsCallback(DefaultCallbacks):
                 return policy_data
         return None
 
+    @staticmethod
+    def _algorithm_config_value(algorithm, key: str, default=np.nan):
+        """Read a scalar from AlgorithmConfig or its legacy dict form."""
+        cfg = algorithm.config
+        attr_name = "lambda_" if key == "lambda" else key
+
+        try:
+            value = getattr(cfg, attr_name)
+            if value is not None:
+                return value
+        except (AttributeError, TypeError):
+            pass
+
+        if isinstance(cfg, dict):
+            if key in cfg:
+                return cfg[key]
+            if attr_name in cfg:
+                return cfg[attr_name]
+
+        try:
+            return cfg[key]
+        except Exception:
+            try:
+                return cfg[attr_name]
+            except Exception:
+                return default
+
+    @staticmethod
+    def _get_default_policy(algorithm):
+        try:
+            return algorithm.get_policy("default_policy")
+        except Exception:
+            try:
+                return algorithm.get_policy()
+            except Exception:
+                return None
+
+    def _sync_effective_hyperparams(self, algorithm) -> None:
+        """Re-apply current Tune/PBT values after checkpoint restoration.
+
+        On RLlib's legacy PPO stack, restoring a donor checkpoint can restore
+        donor-side policy configuration and optimizer state after PBT has
+        already installed the receiver's mutated configuration.  For a fair
+        PBT-vs-CODA comparison, AlgorithmConfig remains the source of truth and
+        the scalar PPO values susceptible to restore are re-applied here.
+        """
+        policy = self._get_default_policy(algorithm)
+        if policy is None:
+            return
+
+        desired_lr = self._safe_float(
+            self._algorithm_config_value(algorithm, "lr", np.nan), np.nan
+        )
+        desired_clip = self._safe_float(
+            self._algorithm_config_value(algorithm, "clip_param", np.nan), np.nan
+        )
+        desired_lambda = self._safe_float(
+            self._algorithm_config_value(algorithm, "lambda", np.nan), np.nan
+        )
+        desired_entropy = self._safe_float(
+            self._algorithm_config_value(algorithm, "entropy_coeff", np.nan), np.nan
+        )
+
+        policy_config = getattr(policy, "config", None)
+        if isinstance(policy_config, dict):
+            if np.isfinite(desired_lr):
+                policy_config["lr"] = float(desired_lr)
+            if np.isfinite(desired_clip):
+                policy_config["clip_param"] = float(desired_clip)
+            if np.isfinite(desired_lambda):
+                policy_config["lambda"] = float(desired_lambda)
+            if np.isfinite(desired_entropy):
+                policy_config["entropy_coeff"] = float(desired_entropy)
+
+        # PPO has one main optimizer in this configuration.  Update only that
+        # optimizer rather than overwriting arbitrary policy optimizers.
+        if np.isfinite(desired_lr):
+            if hasattr(policy, "cur_lr"):
+                try:
+                    policy.cur_lr = float(desired_lr)
+                except Exception:
+                    pass
+
+            optimizers = getattr(policy, "_optimizers", None) or []
+            if optimizers:
+                try:
+                    for param_group in optimizers[0].param_groups:
+                        param_group["lr"] = float(desired_lr)
+                except Exception:
+                    pass
+
+        if np.isfinite(desired_entropy) and hasattr(policy, "entropy_coeff"):
+            try:
+                policy.entropy_coeff = float(desired_entropy)
+            except Exception:
+                pass
+
+    def _audit_effective_hyperparams(self, algorithm, custom: dict) -> None:
+        """Record desired and effective PPO values after checkpoint restore."""
+        policy = self._get_default_policy(algorithm)
+        if policy is None:
+            return
+
+        policy_config = getattr(policy, "config", {}) or {}
+        if not isinstance(policy_config, dict):
+            policy_config = {}
+
+        desired = {
+            "lr": self._safe_float(
+                self._algorithm_config_value(algorithm, "lr", np.nan), np.nan
+            ),
+            "clip_param": self._safe_float(
+                self._algorithm_config_value(algorithm, "clip_param", np.nan), np.nan
+            ),
+            "lambda": self._safe_float(
+                self._algorithm_config_value(algorithm, "lambda", np.nan), np.nan
+            ),
+            "entropy_coeff": self._safe_float(
+                self._algorithm_config_value(algorithm, "entropy_coeff", np.nan), np.nan
+            ),
+        }
+
+        optimizers = getattr(policy, "_optimizers", None) or []
+        effective_lr = np.nan
+        if optimizers:
+            try:
+                effective_lr = self._safe_float(
+                    optimizers[0].param_groups[0].get("lr", np.nan), np.nan
+                )
+            except Exception:
+                pass
+
+        effective = {
+            "lr": effective_lr,
+            "clip_param": self._safe_float(
+                policy_config.get("clip_param", np.nan), np.nan
+            ),
+            "lambda": self._safe_float(
+                policy_config.get("lambda", np.nan), np.nan
+            ),
+            "entropy_coeff": self._safe_float(
+                getattr(
+                    policy,
+                    "entropy_coeff",
+                    policy_config.get("entropy_coeff", np.nan),
+                ),
+                np.nan,
+            ),
+        }
+
+        mismatch_count = 0
+        for name in ("lr", "clip_param", "lambda", "entropy_coeff"):
+            custom[f"pbt_desired_{name}"] = desired[name]
+            custom[f"pbt_effective_{name}"] = effective[name]
+            mismatch = float(
+                np.isfinite(desired[name])
+                and np.isfinite(effective[name])
+                and not np.isclose(
+                    desired[name], effective[name], rtol=1e-7, atol=1e-12
+                )
+            )
+            custom[f"pbt_mismatch_{name}"] = mismatch
+            mismatch_count += int(mismatch)
+
+        custom["pbt_effective_hp_mismatch_count"] = float(mismatch_count)
+
+    def on_checkpoint_loaded(self, *, algorithm, **kwargs):
+        # Restore donor state first, then enforce the PBT-mutated configuration.
+        self._sync_effective_hyperparams(algorithm)
+
     def on_train_result(self, *, algorithm, result: dict, **kwargs):
+        # Defensive synchronization also covers Ray versions where callback
+        # ordering around checkpoint restoration differs.
+        self._sync_effective_hyperparams(algorithm)
+
         custom = result.setdefault("custom_metrics", {})
+        self._audit_effective_hyperparams(algorithm, custom)
         learner_stats = self._extract_learner_stats(result)
 
         if learner_stats is None:
@@ -293,6 +460,29 @@ def _save_metadata(
         "hyperparameter_bounds": HYPERPARAM_BOUNDS,
         "fixed_entropy_coeff": FIXED_ENTROPY_COEFF,
         "fixed_vf_loss_coeff": FIXED_VF_LOSS_COEFF,
+        "fixed_ppo": {
+            "gamma": 0.99,
+            "minibatch_size": 512,
+            "num_sgd_iter": 10,
+            "grad_clip": 0.5,
+            "vf_clip_param": 10.0,
+            "kl_coeff": 0.2,
+            "kl_target": 0.01,
+            "network": [512, 512],
+            "activation": "tanh",
+            "vf_share_layers": False,
+            "env_runners": 4,
+            "num_envs_per_runner": 8,
+            "observation_filter": "MeanStdFilter",
+        },
+        "restore_hyperparameter_sync": {
+            "enabled": True,
+            "source_of_truth": "AlgorithmConfig/Tune PBT configuration",
+            "synchronized": [
+                "lr", "clip_param", "lambda", "entropy_coeff"
+            ],
+            "audit_prefix": "pbt_",
+        },
         "pbt": {
             "perturbation_interval": perturbation_interval,
             "quantile_fraction": quantile_fraction,
@@ -355,7 +545,7 @@ def _build_ppo_config(env_name: str, seed: int) -> PPOConfig:
             use_kl_loss=True,
             kl_coeff=0.2,
             kl_target=0.01,
-            gamma=0.999,
+            gamma=0.99,
             grad_clip=0.5,
             num_sgd_iter=10,
             vf_clip_param=10.0,
@@ -400,6 +590,19 @@ def _extract_metrics(
         "custom_metrics/vf_explained_var",
         "custom_metrics/policy_entropy",
         "custom_metrics/diagnostics_valid",
+        "custom_metrics/pbt_desired_lr",
+        "custom_metrics/pbt_effective_lr",
+        "custom_metrics/pbt_mismatch_lr",
+        "custom_metrics/pbt_desired_clip_param",
+        "custom_metrics/pbt_effective_clip_param",
+        "custom_metrics/pbt_mismatch_clip_param",
+        "custom_metrics/pbt_desired_lambda",
+        "custom_metrics/pbt_effective_lambda",
+        "custom_metrics/pbt_mismatch_lambda",
+        "custom_metrics/pbt_desired_entropy_coeff",
+        "custom_metrics/pbt_effective_entropy_coeff",
+        "custom_metrics/pbt_mismatch_entropy_coeff",
+        "custom_metrics/pbt_effective_hp_mismatch_count",
         "perf/gpu_util_percent0",
         "perf/cpu_util_percent",
         "perf/ram_util_percent",
@@ -413,6 +616,10 @@ def _extract_metrics(
 
         present = [c for c in columns_wanted if c in df.columns]
         out = df[present].copy()
+        # Preserve the causal row order emitted by Tune.  After checkpoint
+        # inheritance, training_iteration/timesteps_total may move backward, so
+        # sorting by those counters can interleave different lineages.
+        out["causal_order"] = np.arange(len(out), dtype=int)
         out["entorno"] = env_name
         out["semilla"] = seed
         out["agente_id"] = f"Agente_{idx + 1}"
@@ -420,10 +627,10 @@ def _extract_metrics(
 
     if frames:
         final = pd.concat(frames, ignore_index=True)
-        sort_cols = ["agente_id"]
-        if "training_iteration" in final.columns:
-            sort_cols.append("training_iteration")
-        final = final.sort_values(sort_cols)
+        final = final.sort_values(
+            ["agente_id", "causal_order"],
+            kind="mergesort",
+        )
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         final.to_csv(output_path, index=False)
@@ -457,6 +664,7 @@ def _extract_pbt_history(
 
         present = [c for c in wanted if c in df.columns]
         out = df[present].copy()
+        out["causal_order"] = np.arange(len(out), dtype=int)
         out["entorno"] = env_name
         out["semilla"] = seed
         out["agente_id"] = f"Agente_{idx + 1}"
@@ -466,10 +674,10 @@ def _extract_pbt_history(
         return
 
     history = pd.concat(frames, ignore_index=True)
-    sort_cols = ["agente_id"]
-    if "training_iteration" in history.columns:
-        sort_cols.append("training_iteration")
-    history = history.sort_values(sort_cols)
+    history = history.sort_values(
+        ["agente_id", "causal_order"],
+        kind="mergesort",
+    )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     history.to_csv(output_path, index=False)

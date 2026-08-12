@@ -78,7 +78,7 @@ HYPERPARAM_BOUNDS = {
     "lr": [1e-5, 1e-3],
 }
 
-# Fixed across PBT, PB2, ASHA, and CODA.
+# Fixed across the current PBT, PB2, ASHA, and CODA comparison.
 FIXED_VF_LOSS_COEFF = 0.5
 
 # Entropy is excluded from the HPO space in PB2 so that it is reserved
@@ -99,7 +99,17 @@ HOPPER_TEST_SEEDS = [1042]
 # Diagnostics callback
 # -----------------------------------------------------------------------------
 class PB2DiagnosticsCallback(DefaultCallbacks):
-    """Record PPO diagnostics without feeding them back to PB2."""
+    """Record PPO diagnostics and audit the effective PB2 configuration.
+
+    Diagnostics are observational only and are never fed back into PB2.  The
+    callback also re-applies the current Tune/PB2 hyperparameters after donor
+    checkpoint restoration because RLlib's legacy PPO stack can otherwise
+    restore donor-side policy configuration and optimizer state.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._iter_count = 0
 
     @staticmethod
     def _safe_float(value, default=np.nan) -> float:
@@ -113,7 +123,6 @@ class PB2DiagnosticsCallback(DefaultCallbacks):
             value = float(value)
         except (TypeError, ValueError, RuntimeError):
             return float(default)
-
         return value if np.isfinite(value) else float(default)
 
     @staticmethod
@@ -136,11 +145,182 @@ class PB2DiagnosticsCallback(DefaultCallbacks):
             }
             if expected.intersection(policy_data.keys()):
                 return policy_data
-
         return None
 
+    @staticmethod
+    def _algorithm_config_value(algorithm, key: str, default=np.nan):
+        """Read a scalar from AlgorithmConfig or its legacy dict form."""
+        cfg = algorithm.config
+        attr_name = "lambda_" if key == "lambda" else key
+
+        try:
+            value = getattr(cfg, attr_name)
+            if value is not None:
+                return value
+        except (AttributeError, TypeError):
+            pass
+
+        if isinstance(cfg, dict):
+            if key in cfg:
+                return cfg[key]
+            if attr_name in cfg:
+                return cfg[attr_name]
+
+        try:
+            return cfg[key]
+        except Exception:
+            try:
+                return cfg[attr_name]
+            except Exception:
+                return default
+
+    @staticmethod
+    def _get_default_policy(algorithm):
+        try:
+            return algorithm.get_policy("default_policy")
+        except Exception:
+            try:
+                return algorithm.get_policy()
+            except Exception:
+                return None
+
+    def _sync_effective_hyperparams(self, algorithm) -> None:
+        """Re-apply current Tune/PB2 values after checkpoint restoration.
+
+        AlgorithmConfig/Tune remains the source of truth.  Only scalar PPO
+        values that can be overwritten by the donor restore path are updated.
+        PPO uses one main optimizer in this experiment, so only that optimizer
+        is modified rather than indiscriminately overwriting all optimizers.
+        """
+        policy = self._get_default_policy(algorithm)
+        if policy is None:
+            return
+
+        desired_lr = self._safe_float(
+            self._algorithm_config_value(algorithm, "lr", np.nan), np.nan
+        )
+        desired_clip = self._safe_float(
+            self._algorithm_config_value(algorithm, "clip_param", np.nan), np.nan
+        )
+        desired_lambda = self._safe_float(
+            self._algorithm_config_value(algorithm, "lambda", np.nan), np.nan
+        )
+        desired_entropy = self._safe_float(
+            self._algorithm_config_value(algorithm, "entropy_coeff", np.nan), np.nan
+        )
+
+        policy_config = getattr(policy, "config", None)
+        if isinstance(policy_config, dict):
+            if np.isfinite(desired_lr):
+                policy_config["lr"] = float(desired_lr)
+            if np.isfinite(desired_clip):
+                policy_config["clip_param"] = float(desired_clip)
+            if np.isfinite(desired_lambda):
+                policy_config["lambda"] = float(desired_lambda)
+            if np.isfinite(desired_entropy):
+                policy_config["entropy_coeff"] = float(desired_entropy)
+
+        if np.isfinite(desired_lr):
+            if hasattr(policy, "cur_lr"):
+                try:
+                    policy.cur_lr = float(desired_lr)
+                except Exception:
+                    pass
+
+            optimizers = getattr(policy, "_optimizers", None) or []
+            if optimizers:
+                try:
+                    for param_group in optimizers[0].param_groups:
+                        param_group["lr"] = float(desired_lr)
+                except Exception:
+                    pass
+
+        if np.isfinite(desired_entropy) and hasattr(policy, "entropy_coeff"):
+            try:
+                policy.entropy_coeff = float(desired_entropy)
+            except Exception:
+                pass
+
+    def _audit_effective_hyperparams(self, algorithm, custom: dict) -> None:
+        """Log desired versus effective PPO values after checkpoint restore."""
+        policy = self._get_default_policy(algorithm)
+        if policy is None:
+            return
+
+        policy_config = getattr(policy, "config", {}) or {}
+        if not isinstance(policy_config, dict):
+            policy_config = {}
+
+        desired = {
+            "lr": self._safe_float(
+                self._algorithm_config_value(algorithm, "lr", np.nan), np.nan
+            ),
+            "clip_param": self._safe_float(
+                self._algorithm_config_value(algorithm, "clip_param", np.nan), np.nan
+            ),
+            "lambda": self._safe_float(
+                self._algorithm_config_value(algorithm, "lambda", np.nan), np.nan
+            ),
+            "entropy_coeff": self._safe_float(
+                self._algorithm_config_value(algorithm, "entropy_coeff", np.nan), np.nan
+            ),
+        }
+
+        optimizers = getattr(policy, "_optimizers", None) or []
+        effective_lr = np.nan
+        if optimizers:
+            try:
+                effective_lr = self._safe_float(
+                    optimizers[0].param_groups[0].get("lr", np.nan), np.nan
+                )
+            except Exception:
+                pass
+
+        effective = {
+            "lr": effective_lr,
+            "clip_param": self._safe_float(
+                policy_config.get("clip_param", np.nan), np.nan
+            ),
+            "lambda": self._safe_float(
+                policy_config.get("lambda", np.nan), np.nan
+            ),
+            "entropy_coeff": self._safe_float(
+                getattr(
+                    policy,
+                    "entropy_coeff",
+                    policy_config.get("entropy_coeff", np.nan),
+                ),
+                np.nan,
+            ),
+        }
+
+        mismatch_count = 0
+        for name in ("lr", "clip_param", "lambda", "entropy_coeff"):
+            custom[f"pb2_desired_{name}"] = desired[name]
+            custom[f"pb2_effective_{name}"] = effective[name]
+            mismatch = float(
+                np.isfinite(desired[name])
+                and np.isfinite(effective[name])
+                and not np.isclose(
+                    desired[name], effective[name], rtol=1e-7, atol=1e-12
+                )
+            )
+            custom[f"pb2_mismatch_{name}"] = mismatch
+            mismatch_count += int(mismatch)
+
+        custom["pb2_effective_hp_mismatch_count"] = float(mismatch_count)
+
+    def on_checkpoint_loaded(self, *, algorithm, **kwargs):
+        # Restore donor weights/state first, then enforce PB2's selected config.
+        self._sync_effective_hyperparams(algorithm)
+
     def on_train_result(self, *, algorithm, result: dict, **kwargs):
+        # Defensive synchronization also covers Ray versions with different
+        # checkpoint-callback ordering.
+        self._sync_effective_hyperparams(algorithm)
+
         custom = result.setdefault("custom_metrics", {})
+        self._audit_effective_hyperparams(algorithm, custom)
         learner_stats = self._extract_learner_stats(result)
 
         if learner_stats is None:
@@ -176,6 +356,23 @@ class PB2DiagnosticsCallback(DefaultCallbacks):
         custom["policy_entropy"] = policy_entropy
         custom["diagnostics_valid"] = float(valid)
 
+        self._iter_count += 1
+        if self._iter_count % 5 == 0:
+            try:
+                cfg = algorithm.config
+                logger.info(
+                    "PB2 PPO diagnostics | KL=%.5f entropy=%.4f "
+                    "batch=%s lambda=%.4f clip=%.4f lr=%.6g mismatches=%d",
+                    policy_kl,
+                    policy_entropy,
+                    getattr(cfg, "train_batch_size", np.nan),
+                    float(getattr(cfg, "lambda_", np.nan)),
+                    float(getattr(cfg, "clip_param", np.nan)),
+                    float(getattr(cfg, "lr", np.nan)),
+                    int(custom.get("pb2_effective_hp_mismatch_count", 0.0)),
+                )
+            except Exception:
+                pass
 
 # -----------------------------------------------------------------------------
 # PB2 executable-config guard
@@ -263,6 +460,13 @@ def _save_metadata(
     seed: int,
     w_pb2_params: dict,
 ) -> None:
+    perturbation_interval = int(
+        w_pb2_params.get("perturbation_interval", 50_000)
+    )
+    quantile_fraction = float(
+        w_pb2_params.get("quantile_fraction", 0.25)
+    )
+
     payload = {
         "algorithm": ALGO_NAME,
         "run_name": OUTPUT_NAME,
@@ -277,20 +481,48 @@ def _save_metadata(
             "lr",
         ],
         "hyperparameter_bounds": HYPERPARAM_BOUNDS,
+        "initial_sampling": {
+            "train_batch_size": "integer uniform",
+            "lambda": "uniform",
+            "clip_param": "uniform",
+            "lr": "loguniform",
+        },
         "fixed_entropy_coeff": FIXED_ENTROPY_COEFF,
         "fixed_vf_loss_coeff": FIXED_VF_LOSS_COEFF,
-        "perturbation_interval": int(
-            w_pb2_params.get("perturbation_interval", 50_000)
-        ),
-        "quantile_fraction": float(
-            w_pb2_params.get("quantile_fraction", 0.25)
-        ),
-        "population_adaptation": "asynchronous",
-        "pb2_custom_explore_guard": {
+        "fixed_ppo": {
+            "gamma": 0.99,
+            "minibatch_size": 512,
+            "num_sgd_iter": 10,
+            "grad_clip": 0.5,
+            "vf_clip_param": 10.0,
+            "kl_coeff": 0.2,
+            "kl_target": 0.01,
+            "network": [512, 512],
+            "activation": "tanh",
+            "vf_share_layers": False,
+            "env_runners": 4,
+            "num_envs_per_runner": 8,
+            "observation_filter": "MeanStdFilter",
+        },
+        "pb2": {
+            "perturbation_interval": perturbation_interval,
+            "quantile_fraction": quantile_fraction,
+            "synch": False,
+            "implementation": "Ray Tune native PB2",
+            "surrogate_coordinate_representation": (
+                "native Ray PB2 representation; CODA-specific log-lr "
+                "representation is intentionally not injected into the baseline"
+            ),
+            "bounded_custom_explore": True,
             "integer_train_batch_size": True,
-            "clips_to_search_bounds": True,
-            "forces_entropy_coeff": FIXED_ENTROPY_COEFF,
-            "forces_vf_loss_coeff": FIXED_VF_LOSS_COEFF,
+        },
+        "restore_hyperparameter_sync": {
+            "enabled": True,
+            "source_of_truth": "AlgorithmConfig/Tune PB2 configuration",
+            "synchronized": [
+                "lr", "clip_param", "lambda", "entropy_coeff"
+            ],
+            "audit_prefix": "pb2_",
         },
         "versions": {
             "python": sys.version,
@@ -310,7 +542,6 @@ def _save_metadata(
         json.dumps(payload, indent=2),
         encoding="utf-8",
     )
-
 
 def _build_ppo_config(env_name: str, seed: int) -> PPOConfig:
     return (
@@ -344,7 +575,7 @@ def _build_ppo_config(env_name: str, seed: int) -> PPOConfig:
             use_kl_loss=True,
             kl_coeff=0.2,
             kl_target=0.01,
-            gamma=0.999,
+            gamma=0.99,
             grad_clip=0.5,
             num_sgd_iter=10,
             vf_clip_param=10.0,
@@ -389,6 +620,19 @@ def _extract_metrics(
         "custom_metrics/vf_explained_var",
         "custom_metrics/policy_entropy",
         "custom_metrics/diagnostics_valid",
+        "custom_metrics/pb2_desired_lr",
+        "custom_metrics/pb2_effective_lr",
+        "custom_metrics/pb2_mismatch_lr",
+        "custom_metrics/pb2_desired_clip_param",
+        "custom_metrics/pb2_effective_clip_param",
+        "custom_metrics/pb2_mismatch_clip_param",
+        "custom_metrics/pb2_desired_lambda",
+        "custom_metrics/pb2_effective_lambda",
+        "custom_metrics/pb2_mismatch_lambda",
+        "custom_metrics/pb2_desired_entropy_coeff",
+        "custom_metrics/pb2_effective_entropy_coeff",
+        "custom_metrics/pb2_mismatch_entropy_coeff",
+        "custom_metrics/pb2_effective_hp_mismatch_count",
         "perf/gpu_util_percent0",
         "perf/cpu_util_percent",
         "perf/ram_util_percent",
@@ -406,6 +650,10 @@ def _extract_metrics(
         ]
 
         out = df[present].copy()
+        # metrics_dataframe is already in causal execution order for this Ray
+        # trial.  Preserve that order explicitly because checkpoint inheritance
+        # can make both timesteps_total and training_iteration non-monotonic.
+        out["causal_order"] = np.arange(len(out), dtype=int)
         out["entorno"] = env_name
         out["semilla"] = seed
         out["agente_id"] = f"Agente_{idx + 1}"
@@ -413,14 +661,10 @@ def _extract_metrics(
 
     if frames:
         final = pd.concat(frames, ignore_index=True)
-
-        # Keep causal execution order within each Ray trial. Do not sort by
-        # timesteps_total because checkpoint inheritance can decrease it.
-        sort_cols = ["agente_id"]
-        if "training_iteration" in final.columns:
-            sort_cols.append("training_iteration")
-
-        final = final.sort_values(sort_cols)
+        final = final.sort_values(
+            ["agente_id", "causal_order"],
+            kind="mergesort",
+        )
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         final.to_csv(output_path, index=False)
