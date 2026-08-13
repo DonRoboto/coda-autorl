@@ -911,6 +911,9 @@ def run_experiment(
                 verbose=0,
                 storage_path=str(storage_root),
                 stop={TIME_ATTR: TIMESTEPS_MAX},
+                checkpoint_config=tune.CheckpointConfig(
+                    checkpoint_at_end=True,
+                ),
             ),
         )
 

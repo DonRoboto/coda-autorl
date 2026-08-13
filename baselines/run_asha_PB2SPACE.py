@@ -1,3 +1,5 @@
+
+
 from __future__ import annotations
 
 # CPU limits must be set before NumPy / Ray / PyTorch imports.
@@ -46,7 +48,7 @@ from w_pb2_experimentos_config import (  # noqa: E402
 
 ALGO_NAME = "ASHA"
 
-# Keep output names aligned with PBT/PB2/CODA PB2SPACE campaign.
+# Keep output names aligned with the final PBT/PB2/CODA PB2SPACE campaign.
 # Set ASHA_RUN_TAG="" for canonical names such as metrics_ASHA_seed1042.csv.
 RUN_TAG = os.environ.get("ASHA_RUN_TAG", "PB2SPACE").strip()
 OUTPUT_NAME = f"{ALGO_NAME}_{RUN_TAG}" if RUN_TAG else ALGO_NAME
@@ -65,16 +67,40 @@ HYPERPARAM_BOUNDS = {
 # Fixed across PBT/PB2/ASHA/CODA.
 FIXED_VF_LOSS_COEFF = 0.5
 FIXED_ENTROPY_COEFF = 0.0
+FIXED_GAMMA = 0.99
 
-# ASHA protocol used in the manuscript.
-ASHA_NUM_SAMPLES = 8
-ASHA_GRACE_PERIOD = 500_000
+
+# -----------------------------------------------------------------------------
+# ASHA budget-calibration protocol
+# -----------------------------------------------------------------------------
+#
+# IMPORTANT:
+# ASHA is asynchronous. Therefore, the realized interaction budget is not
+# guaranteed to equal a simple idealized successive-halving formula.
+#
+# This configuration is intended as a PILOT calibration:
+#   - many initial configurations,
+#   - early pruning beginning at 50k interactions,
+#   - same maximum per-trial horizon as PBT/PB2/CODA,
+#   - realized budget measured explicitly.
+#
+# After 2-3 pilot runs, inspect the reported realized budget and, if needed,
+# adjust ASHA_NUM_SAMPLES ONCE before the final experimental campaign.
+#
+ASHA_NUM_SAMPLES = 30
+ASHA_GRACE_PERIOD = 50_000
 ASHA_REDUCTION_FACTOR = 2
 ASHA_BRACKETS = 1
 
-# Nominal idealized allocation:
-# 8*0.5M + 4*(1.0M-0.5M) + 2*(2.0M-1.0M) = 8M interactions.
-ASHA_NOMINAL_AGGREGATE_BUDGET = 8_000_000
+# Target aggregate interaction budget used by PBT/PB2/CODA:
+# 4 workers x 2M interactions = 8M.
+ASHA_TARGET_AGGREGATE_BUDGET = 8_000_000
+
+# Budget-ratio ranges used only for audit/reporting.
+ASHA_BUDGET_EXCELLENT_LOW = 0.95
+ASHA_BUDGET_EXCELLENT_HIGH = 1.05
+ASHA_BUDGET_ACCEPTABLE_LOW = 0.90
+ASHA_BUDGET_ACCEPTABLE_HIGH = 1.10
 
 
 # -----------------------------------------------------------------------------
@@ -190,12 +216,76 @@ def _seed_everything(seed: int) -> None:
     torch.set_num_threads(1)
 
 
+def _budget_status(ratio: float) -> str:
+    if not np.isfinite(ratio):
+        return "unavailable"
+
+    if ASHA_BUDGET_EXCELLENT_LOW <= ratio <= ASHA_BUDGET_EXCELLENT_HIGH:
+        return "excellent"
+
+    if ASHA_BUDGET_ACCEPTABLE_LOW <= ratio <= ASHA_BUDGET_ACCEPTABLE_HIGH:
+        return "acceptable"
+
+    if ratio < ASHA_BUDGET_ACCEPTABLE_LOW:
+        return "under_target"
+
+    return "over_target"
+
+
+def _suggest_num_samples_from_budget(
+    current_num_samples: int,
+    realized_budget: float,
+) -> Optional[int]:
+    """Budget-only calibration suggestion.
+
+    This does NOT use reward. It simply rescales the number of initial trials
+    according to the observed interaction-budget ratio.
+
+    Because ASHA is asynchronous and nonlinear, this is only a pilot heuristic.
+    Final ASHA_NUM_SAMPLES should be fixed before the final campaign.
+    """
+    if not np.isfinite(realized_budget) or realized_budget <= 0:
+        return None
+
+    suggested = int(
+        round(
+            current_num_samples
+            * ASHA_TARGET_AGGREGATE_BUDGET
+            / realized_budget
+        )
+    )
+
+    return max(2, suggested)
+
+
 def _save_metadata(
     path: Path,
     *,
     env_name: str,
     seed: int,
+    realized_budget: Optional[float] = None,
 ) -> None:
+    realized_budget_value = (
+        float(realized_budget)
+        if realized_budget is not None and np.isfinite(realized_budget)
+        else None
+    )
+
+    realized_budget_ratio = (
+        realized_budget_value / ASHA_TARGET_AGGREGATE_BUDGET
+        if realized_budget_value is not None
+        else None
+    )
+
+    suggested_num_samples = (
+        _suggest_num_samples_from_budget(
+            ASHA_NUM_SAMPLES,
+            realized_budget_value,
+        )
+        if realized_budget_value is not None
+        else None
+    )
+
     payload = {
         "algorithm": ALGO_NAME,
         "run_name": OUTPUT_NAME,
@@ -209,7 +299,23 @@ def _save_metadata(
         "grace_period": ASHA_GRACE_PERIOD,
         "reduction_factor": ASHA_REDUCTION_FACTOR,
         "brackets": ASHA_BRACKETS,
-        "nominal_aggregate_budget": ASHA_NOMINAL_AGGREGATE_BUDGET,
+        "target_aggregate_budget": ASHA_TARGET_AGGREGATE_BUDGET,
+        "realized_aggregate_budget": realized_budget_value,
+        "realized_to_target_budget_ratio": realized_budget_ratio,
+        "budget_status": (
+            _budget_status(realized_budget_ratio)
+            if realized_budget_ratio is not None
+            else None
+        ),
+        "pilot_budget_calibration": {
+            "enabled": True,
+            "uses_reward": False,
+            "suggested_num_samples_from_this_run": suggested_num_samples,
+            "note": (
+                "Fix ASHA_NUM_SAMPLES before the final campaign. "
+                "Do not tune it using performance/reward."
+            ),
+        },
         "optimized_hyperparameters": [
             "train_batch_size",
             "lambda",
@@ -227,7 +333,7 @@ def _save_metadata(
         "fixed_entropy_coeff": FIXED_ENTROPY_COEFF,
         "fixed_vf_loss_coeff": FIXED_VF_LOSS_COEFF,
         "ppo": {
-            "gamma": 0.99,
+            "gamma": FIXED_GAMMA,
             "grad_clip": 0.5,
             "minibatch_size": 512,
             "num_sgd_iter": 10,
@@ -247,6 +353,12 @@ def _save_metadata(
             "num_to_keep": 1,
             "checkpoint_at_end": True,
         },
+        "audit": {
+            "causal_order_exported": True,
+            "static_hyperparameter_validation": True,
+            "gamma_exported_in_metrics": True,
+            "realized_budget_recorded": True,
+        },
         "versions": {
             "python": sys.version,
             "ray": ray.__version__,
@@ -261,7 +373,10 @@ def _save_metadata(
     }
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    path.write_text(
+        json.dumps(payload, indent=2),
+        encoding="utf-8",
+    )
 
 
 def _build_ppo_config(env_name: str, seed: int) -> PPOConfig:
@@ -297,7 +412,7 @@ def _build_ppo_config(env_name: str, seed: int) -> PPOConfig:
             use_kl_loss=True,
             kl_coeff=0.2,
             kl_target=0.01,
-            gamma=0.99,
+            gamma=FIXED_GAMMA,
             grad_clip=0.5,
             num_sgd_iter=10,
             vf_clip_param=10.0,
@@ -314,9 +429,12 @@ def _last_row(df: pd.DataFrame) -> Optional[pd.Series]:
     if df is None or df.empty:
         return None
 
-    # ASHA has no checkpoint inheritance, so timesteps_total is monotone in
-    # normal operation. Still prefer chronological execution information when
-    # available to avoid relying on physical CSV row order.
+    if "causal_order" in df.columns:
+        order = pd.to_numeric(df["causal_order"], errors="coerce")
+        finite = order.notna()
+        if finite.any():
+            return df.loc[order[finite].idxmax()]
+
     if "time_total_s" in df.columns:
         order = pd.to_numeric(df["time_total_s"], errors="coerce")
         finite = order.notna()
@@ -338,6 +456,56 @@ def _safe_numeric(value, default=np.nan) -> float:
     except (TypeError, ValueError):
         return float(default)
     return value if np.isfinite(value) else float(default)
+
+
+def _validate_static_asha_configs(result_grid) -> None:
+    """Fail if any ASHA trial changes a hyperparameter during training.
+
+    ASHA is a resource-allocation baseline over static configurations.
+    This validation is audit-only and does not alter scheduler behavior.
+    """
+    hp_columns = [
+        "config/train_batch_size",
+        "config/lambda",
+        "config/clip_param",
+        "config/lr",
+        "config/entropy_coeff",
+        "config/vf_loss_coeff",
+        "config/gamma",
+    ]
+
+    for idx, result in enumerate(result_grid):
+        df = result.metrics_dataframe
+
+        if df is None or df.empty:
+            continue
+
+        for col in hp_columns:
+            if col not in df.columns:
+                continue
+
+            values = pd.to_numeric(
+                df[col],
+                errors="coerce",
+            ).dropna()
+
+            if values.empty:
+                continue
+
+            ref = float(values.iloc[0])
+            array = values.to_numpy(dtype=float)
+
+            if not np.allclose(
+                array,
+                ref,
+                rtol=1e-12,
+                atol=1e-15,
+                equal_nan=True,
+            ):
+                raise RuntimeError(
+                    f"ASHA trial {idx + 1} changed {col}. "
+                    f"Observed values: {values.unique()}"
+                )
 
 
 def _extract_metrics(
@@ -363,6 +531,7 @@ def _extract_metrics(
         "config/clip_param",
         "config/train_batch_size",
         "config/vf_loss_coeff",
+        "config/gamma",
         "info/learner/default_policy/learner_stats/kl",
         "info/learner/default_policy/learner_stats/entropy",
         "info/learner/default_policy/learner_stats/vf_explained_var",
@@ -383,35 +552,60 @@ def _extract_metrics(
         if df is None or df.empty:
             continue
 
-        present = [c for c in columns_wanted if c in df.columns]
+        present = [
+            c for c in columns_wanted
+            if c in df.columns
+        ]
+
         out = df[present].copy()
+
+        # Explicit execution-order index for a common downstream pipeline.
+        out["causal_order"] = np.arange(
+            len(out),
+            dtype=np.int64,
+        )
+
         out["entorno"] = env_name
         out["semilla"] = seed
-        # Keep the same column name used by the PBT/PB2/CODA analysis scripts.
         out["agente_id"] = f"Agente_{idx + 1}"
-        out["asha_trial_id"] = str(getattr(result, "path", ""))
+        out["asha_trial_id"] = str(
+            getattr(result, "path", "")
+        )
 
         if TIME_ATTR in df.columns:
-            max_t = pd.to_numeric(df[TIME_ATTR], errors="coerce").max()
-            reached = bool(np.isfinite(max_t) and max_t >= TIMESTEPS_MAX)
+            max_t = pd.to_numeric(
+                df[TIME_ATTR],
+                errors="coerce",
+            ).max()
+            reached = bool(
+                np.isfinite(max_t)
+                and max_t >= TIMESTEPS_MAX
+            )
         else:
             reached = False
-        out["asha_reached_max_resource"] = int(reached)
 
+        out["asha_reached_max_resource"] = int(reached)
         frames.append(out)
 
     if frames:
-        final = pd.concat(frames, ignore_index=True)
+        final = pd.concat(
+            frames,
+            ignore_index=True,
+        )
 
-        sort_cols = ["agente_id"]
-        if "time_total_s" in final.columns:
-            sort_cols.append("time_total_s")
-        elif "training_iteration" in final.columns:
-            sort_cols.append("training_iteration")
+        final = final.sort_values(
+            ["agente_id", "causal_order"],
+            kind="stable",
+        )
 
-        final = final.sort_values(sort_cols, kind="stable")
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        final.to_csv(output_path, index=False)
+        output_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+        final.to_csv(
+            output_path,
+            index=False,
+        )
 
 
 def _save_asha_summary(
@@ -424,6 +618,18 @@ def _save_asha_summary(
 
     for idx, result in enumerate(result_grid):
         df = result.metrics_dataframe
+
+        if (
+            df is not None
+            and not df.empty
+            and "causal_order" not in df.columns
+        ):
+            df = df.copy()
+            df["causal_order"] = np.arange(
+                len(df),
+                dtype=np.int64,
+            )
+
         last = _last_row(df)
 
         if last is None:
@@ -433,13 +639,35 @@ def _save_asha_summary(
             lambda_ = np.nan
             clip = np.nan
             lr = np.nan
+            gamma = np.nan
         else:
-            final_t = _safe_numeric(last.get(TIME_ATTR, np.nan))
-            final_reward = _safe_numeric(last.get(METRIC, np.nan))
-            batch = _safe_numeric(last.get("config/train_batch_size", np.nan))
-            lambda_ = _safe_numeric(last.get("config/lambda", np.nan))
-            clip = _safe_numeric(last.get("config/clip_param", np.nan))
-            lr = _safe_numeric(last.get("config/lr", np.nan))
+            final_t = _safe_numeric(
+                last.get(TIME_ATTR, np.nan)
+            )
+            final_reward = _safe_numeric(
+                last.get(METRIC, np.nan)
+            )
+            batch = _safe_numeric(
+                last.get(
+                    "config/train_batch_size",
+                    np.nan,
+                )
+            )
+            lambda_ = _safe_numeric(
+                last.get("config/lambda", np.nan)
+            )
+            clip = _safe_numeric(
+                last.get(
+                    "config/clip_param",
+                    np.nan,
+                )
+            )
+            lr = _safe_numeric(
+                last.get("config/lr", np.nan)
+            )
+            gamma = _safe_numeric(
+                last.get("config/gamma", np.nan)
+            )
 
         rows.append(
             {
@@ -449,24 +677,44 @@ def _save_asha_summary(
                 "final_timesteps_total": final_t,
                 "final_training_return": final_reward,
                 "reached_max_resource": int(
-                    np.isfinite(final_t) and final_t >= TIMESTEPS_MAX
+                    np.isfinite(final_t)
+                    and final_t >= TIMESTEPS_MAX
                 ),
                 "train_batch_size": batch,
                 "lambda": lambda_,
                 "clip_param": clip,
                 "lr": lr,
-                "has_checkpoint": int(bool(result.checkpoint)),
-                "checkpoint_path": (
-                    str(result.checkpoint.path) if result.checkpoint else ""
+                "gamma": gamma,
+                "has_checkpoint": int(
+                    bool(result.checkpoint)
                 ),
-                "result_path": str(getattr(result, "path", "")),
-                "error": str(result.error) if getattr(result, "error", None) else "",
+                "checkpoint_path": (
+                    str(result.checkpoint.path)
+                    if result.checkpoint
+                    else ""
+                ),
+                "result_path": str(
+                    getattr(result, "path", "")
+                ),
+                "error": (
+                    str(result.error)
+                    if getattr(result, "error", None)
+                    else ""
+                ),
             }
         )
 
     summary = pd.DataFrame(rows)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    summary.to_csv(output_path, index=False)
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    summary.to_csv(
+        output_path,
+        index=False,
+    )
+
     return summary
 
 
@@ -475,41 +723,62 @@ def _copy_final_checkpoints(
     env_name: str,
     seed: int,
 ) -> None:
-    """Copy each trial's last checkpoint and identify full-budget candidates.
+    """Copy each trial's final checkpoint and identify full-budget candidates.
 
-    For the final paper, checkpoint selection for held-out testing should use
-    the pre-specified training-side terminal criterion. This helper copies all
-    available checkpoints so that selection can be performed later without
-    rerunning ASHA.
+    Champion selection is intentionally deferred to the common held-out-test
+    script, which uses training data only and a pre-specified terminal criterion.
     """
     root = (
         Path("./results/champions")
         / env_name
         / f"{OUTPUT_NAME}_seed{seed}"
     )
-    root.mkdir(parents=True, exist_ok=True)
+    root.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     candidates = []
 
     for idx, result in enumerate(result_grid):
         df = result.metrics_dataframe
+
+        if (
+            df is not None
+            and not df.empty
+            and "causal_order" not in df.columns
+        ):
+            df = df.copy()
+            df["causal_order"] = np.arange(
+                len(df),
+                dtype=np.int64,
+            )
+
         last = _last_row(df)
 
         final_t = (
-            _safe_numeric(last.get(TIME_ATTR, np.nan))
+            _safe_numeric(
+                last.get(TIME_ATTR, np.nan)
+            )
             if last is not None
             else np.nan
         )
+
         final_reward = (
-            _safe_numeric(last.get(METRIC, np.nan))
+            _safe_numeric(
+                last.get(METRIC, np.nan)
+            )
             if last is not None
             else np.nan
         )
+
         reached_max = bool(
-            np.isfinite(final_t) and final_t >= TIMESTEPS_MAX
+            np.isfinite(final_t)
+            and final_t >= TIMESTEPS_MAX
         )
 
         agent_name = f"Agente_{idx + 1}"
+
         if reached_max:
             candidates.append(
                 {
@@ -520,16 +789,26 @@ def _copy_final_checkpoints(
             )
 
         if not result.checkpoint:
-            logger.warning("No final checkpoint available for %s", agent_name)
+            logger.warning(
+                "No final checkpoint available for %s",
+                agent_name,
+            )
             continue
 
-        source = Path(result.checkpoint.path)
+        source = Path(
+            result.checkpoint.path
+        )
         target = root / agent_name
 
         try:
             if target.exists():
                 shutil.rmtree(target)
-            shutil.copytree(source, target)
+
+            shutil.copytree(
+                source,
+                target,
+            )
+
         except Exception as exc:
             logger.warning(
                 "Could not copy checkpoint %s -> %s: %s",
@@ -538,7 +817,10 @@ def _copy_final_checkpoints(
                 exc,
             )
 
-    candidates_path = root / "full_budget_candidates.json"
+    candidates_path = (
+        root / "full_budget_candidates.json"
+    )
+
     candidates_path.write_text(
         json.dumps(candidates, indent=2),
         encoding="utf-8",
@@ -546,36 +828,129 @@ def _copy_final_checkpoints(
 
     if candidates:
         finite = [
-            x for x in candidates
-            if np.isfinite(x["final_training_return"])
+            x
+            for x in candidates
+            if np.isfinite(
+                x["final_training_return"]
+            )
         ]
+
         if finite:
-            best = max(finite, key=lambda x: x["final_training_return"])
+            best = max(
+                finite,
+                key=lambda x: x[
+                    "final_training_return"
+                ],
+            )
+
             print(
-                "Best full-budget ASHA trial by last training return: "
+                "Best full-budget ASHA trial by last training return "
+                "(diagnostic only; not final champion rule): "
                 f"{best['agente_id']} | "
                 f"return={best['final_training_return']:.3f} | "
                 f"T={best['final_timesteps_total']:.0f}"
             )
+
         else:
             print(
-                f"ASHA full-budget candidates: {len(candidates)} "
+                f"ASHA full-budget candidates: "
+                f"{len(candidates)} "
                 "(terminal returns unavailable)"
             )
+
     else:
         logger.warning(
-            "No ASHA trial reached TIMESTEPS_MAX=%s in %s seed=%s",
+            "No ASHA trial reached TIMESTEPS_MAX=%s "
+            "in %s seed=%s",
             TIMESTEPS_MAX,
             env_name,
             seed,
         )
 
 
-def run_experiment(env_name: str, seed: int) -> bool:
+def _realized_budget_from_summary(
+    summary: pd.DataFrame,
+) -> float:
+    """Sum final ASHA trial resources.
+
+    This is valid for ASHA because trials do not inherit checkpoints and
+    timesteps_total does not reset to a donor lineage.
+    """
+    if summary is None or summary.empty:
+        return 0.0
+
+    values = pd.to_numeric(
+        summary["final_timesteps_total"],
+        errors="coerce",
+    ).fillna(0.0)
+
+    return float(values.sum())
+
+
+def _print_budget_report(
+    realized_budget: float,
+) -> None:
+    ratio = (
+        realized_budget
+        / ASHA_TARGET_AGGREGATE_BUDGET
+        if ASHA_TARGET_AGGREGATE_BUDGET > 0
+        else np.nan
+    )
+
+    status = _budget_status(ratio)
+
+    suggested = _suggest_num_samples_from_budget(
+        ASHA_NUM_SAMPLES,
+        realized_budget,
+    )
+
+    print("\n" + "-" * 72)
+    print("ASHA BUDGET AUDIT")
+    print(
+        f"Current initial trials: {ASHA_NUM_SAMPLES}"
+    )
+    print(
+        f"Grace period: {ASHA_GRACE_PERIOD:,}"
+    )
+    print(
+        f"Realized budget: "
+        f"{realized_budget:,.0f}"
+    )
+    print(
+        f"Target budget: "
+        f"{ASHA_TARGET_AGGREGATE_BUDGET:,.0f}"
+    )
+    print(
+        f"Budget ratio: {ratio:.4f}"
+    )
+    print(
+        f"Budget status: {status}"
+    )
+
+    if suggested is not None:
+        print(
+            "Budget-only suggested ASHA_NUM_SAMPLES "
+            f"for the NEXT pilot: {suggested}"
+        )
+
+    print(
+        "IMPORTANT: choose the final sample count using budget only, "
+        "not reward, and freeze it before the final campaign."
+    )
+    print("-" * 72)
+
+
+def run_experiment(
+    env_name: str,
+    seed: int,
+) -> bool:
     print("\n" + "=" * 72)
     print(
-        f"Starting {OUTPUT_NAME} | env={env_name} | seed={seed} | "
-        f"initial_trials={ASHA_NUM_SAMPLES}"
+        f"Starting {OUTPUT_NAME} | "
+        f"env={env_name} | "
+        f"seed={seed} | "
+        f"initial_trials={ASHA_NUM_SAMPLES} | "
+        f"grace={ASHA_GRACE_PERIOD:,}"
     )
     print("=" * 72)
 
@@ -603,12 +978,19 @@ def run_experiment(env_name: str, seed: int) -> bool:
             include_dashboard=False,
         )
 
-        ppo_config = _build_ppo_config(env_name, seed)
+        ppo_config = _build_ppo_config(
+            env_name,
+            seed,
+        )
 
         storage_root = Path(
             f"./results/ray_tune_logs/{OUTPUT_NAME}"
         ).resolve()
-        storage_root.mkdir(parents=True, exist_ok=True)
+
+        storage_root.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
 
         tuner = tune.Tuner(
             "PPO",
@@ -618,20 +1000,30 @@ def run_experiment(env_name: str, seed: int) -> bool:
                 metric=METRIC,
                 mode="max",
                 trial_name_creator=lambda trial: (
-                    f"{OUTPUT_NAME}_{env_name}_{seed}_{trial.trial_id}"
+                    f"{OUTPUT_NAME}_{env_name}_"
+                    f"{seed}_{trial.trial_id}"
                 ),
                 trial_dirname_creator=lambda trial: (
-                    f"{OUTPUT_NAME}_{env_name}_{seed}_{trial.trial_id}"
+                    f"{OUTPUT_NAME}_{env_name}_"
+                    f"{seed}_{trial.trial_id}"
                 ),
             ),
-            # Legacy dict conversion is kept to expose PPOConfig.lambda_ as the
-            # Tune-compatible config key "lambda", exactly as in PB2/PBT.
+
+            # Legacy dict conversion is kept to expose PPOConfig.lambda_
+            # as the Tune-compatible config key "lambda", exactly as in
+            # PB2/PBT/CODA.
             param_space=ppo_config.to_dict(),
+
             run_config=tune.RunConfig(
-                name=f"{OUTPUT_NAME}_{env_name}_Seed{seed}",
+                name=(
+                    f"{OUTPUT_NAME}_{env_name}_"
+                    f"Seed{seed}"
+                ),
                 verbose=0,
                 storage_path=str(storage_root),
-                stop={TIME_ATTR: TIMESTEPS_MAX},
+                stop={
+                    TIME_ATTR: TIMESTEPS_MAX
+                },
                 checkpoint_config=tune.CheckpointConfig(
                     num_to_keep=1,
                     checkpoint_at_end=True,
@@ -641,18 +1033,31 @@ def run_experiment(env_name: str, seed: int) -> bool:
 
         results = tuner.fit()
 
+        # Audit-only validation:
+        # ASHA hyperparameters must remain static.
+        _validate_static_asha_configs(
+            results
+        )
+
         metrics_path = (
             Path("./results/metrics")
             / env_name
             / f"metrics_{OUTPUT_NAME}_seed{seed}.csv"
         )
-        _extract_metrics(results, env_name, seed, metrics_path)
+
+        _extract_metrics(
+            results,
+            env_name,
+            seed,
+            metrics_path,
+        )
 
         summary_path = (
             Path("./results/scheduler")
             / env_name
             / f"scheduler_{OUTPUT_NAME}_seed{seed}.csv"
         )
+
         summary = _save_asha_summary(
             results,
             env_name,
@@ -660,34 +1065,66 @@ def run_experiment(env_name: str, seed: int) -> bool:
             summary_path,
         )
 
+        realized_budget = (
+            _realized_budget_from_summary(
+                summary
+            )
+        )
+
+        _print_budget_report(
+            realized_budget
+        )
+
         metadata_path = (
             Path("./results/metadata")
             / env_name
             / f"metadata_{OUTPUT_NAME}_seed{seed}.json"
         )
+
         _save_metadata(
             metadata_path,
             env_name=env_name,
             seed=seed,
+            realized_budget=realized_budget,
         )
 
-        _copy_final_checkpoints(results, env_name, seed)
+        _copy_final_checkpoints(
+            results,
+            env_name,
+            seed,
+        )
 
-        n_full = int(summary["reached_max_resource"].sum()) if not summary.empty else 0
+        n_full = (
+            int(
+                summary[
+                    "reached_max_resource"
+                ].sum()
+            )
+            if not summary.empty
+            else 0
+        )
+
         print(
-            f"Completed {OUTPUT_NAME}: {env_name}, seed={seed} | "
-            f"full-budget trials={n_full}/{ASHA_NUM_SAMPLES}"
+            f"Completed {OUTPUT_NAME}: "
+            f"{env_name}, seed={seed} | "
+            f"full-budget trials="
+            f"{n_full}/{ASHA_NUM_SAMPLES}"
         )
+
         return True
 
     except Exception as exc:
-        print(f"\nCRITICAL ERROR in {env_name}, seed={seed}: {exc}")
+        print(
+            f"\nCRITICAL ERROR in "
+            f"{env_name}, seed={seed}: {exc}"
+        )
         traceback.print_exc()
         return False
 
     finally:
         if ray.is_initialized():
             ray.shutdown()
+
         time.sleep(2)
 
 
@@ -698,18 +1135,37 @@ def main() -> None:
     if HOPPER_SMOKE_TEST:
         if HOPPER_TEST_ENV not in CONFIG_EXPERIMENTOS:
             raise KeyError(
-                f"{HOPPER_TEST_ENV!r} is not present in CONFIG_EXPERIMENTOS"
+                f"{HOPPER_TEST_ENV!r} is not present "
+                "in CONFIG_EXPERIMENTOS"
             )
 
         experiment_items = [
-            (HOPPER_TEST_ENV, CONFIG_EXPERIMENTOS[HOPPER_TEST_ENV])
+            (
+                HOPPER_TEST_ENV,
+                CONFIG_EXPERIMENTOS[
+                    HOPPER_TEST_ENV
+                ],
+            )
         ]
-        total = len(HOPPER_TEST_SEEDS)
+
+        total = len(
+            HOPPER_TEST_SEEDS
+        )
+
     else:
-        experiment_items = list(CONFIG_EXPERIMENTOS.items())
+        experiment_items = list(
+            CONFIG_EXPERIMENTOS.items()
+        )
+
         total = sum(
-            len(conf.get("semillas", []))
-            for conf in CONFIG_EXPERIMENTOS.values()
+            len(
+                conf.get(
+                    "semillas",
+                    [],
+                )
+            )
+            for conf
+            in CONFIG_EXPERIMENTOS.values()
         )
 
     done = 0
@@ -718,29 +1174,54 @@ def main() -> None:
         seeds = (
             HOPPER_TEST_SEEDS
             if HOPPER_SMOKE_TEST
-            else env_cfg.get("semillas", [])
+            else env_cfg.get(
+                "semillas",
+                [],
+            )
         )
 
         for seed in seeds:
-            ok = run_experiment(env_name, int(seed))
+            ok = run_experiment(
+                env_name,
+                int(seed),
+            )
 
             if not ok:
-                failures.append(f"{env_name} - seed {seed}")
+                failures.append(
+                    f"{env_name} - seed {seed}"
+                )
 
             done += 1
-            print(f"Global progress: {done}/{total}")
+            print(
+                f"Global progress: "
+                f"{done}/{total}"
+            )
 
-    hours = (time.time() - started) / 3600.0
+    hours = (
+        time.time() - started
+    ) / 3600.0
 
     print("\n" + "-" * 72)
-    print(f"Experiments finished in {hours:.2f} hours")
+    print(
+        f"Experiments finished "
+        f"in {hours:.2f} hours"
+    )
 
     if failures:
-        print(f"Failures ({len(failures)}):")
+        print(
+            f"Failures ({len(failures)}):"
+        )
+
         for failure in failures:
-            print(f"  - {failure}")
+            print(
+                f"  - {failure}"
+            )
+
     else:
-        print("All experiments completed successfully.")
+        print(
+            "All experiments "
+            "completed successfully."
+        )
 
     print("-" * 72)
 

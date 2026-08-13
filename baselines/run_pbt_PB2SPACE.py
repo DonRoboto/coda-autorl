@@ -581,6 +581,7 @@ def _extract_metrics(
         "config/clip_param",
         "config/train_batch_size",
         "config/vf_loss_coeff",
+        "config/gamma",
         "info/learner/default_policy/learner_stats/kl",
         "info/learner/default_policy/learner_stats/entropy",
         "info/learner/default_policy/learner_stats/vf_explained_var",
@@ -837,6 +838,9 @@ def run_experiment(
                 verbose=0,
                 storage_path=str(storage_root),
                 stop={TIME_ATTR: TIMESTEPS_MAX},
+                checkpoint_config=tune.CheckpointConfig(
+                    checkpoint_at_end=True,
+                ),
             ),
         )
 
