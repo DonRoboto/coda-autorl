@@ -15,6 +15,9 @@ IMPORTANT:
 - Put this file in the project root (or run it from there), so any custom
   callback/module referenced by the RLlib checkpoints is importable.
 - Confirm RUN_NAMES below match the names of your final campaign folders.
+- PBT, PB2, and CODA training runs must have been created with
+  CheckpointConfig(checkpoint_at_end=True).  This evaluation script cannot
+  reconstruct a terminal learner state if training did not save it.
 """
 
 # -----------------------------------------------------------------------------
@@ -28,7 +31,6 @@ os.environ.setdefault("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0")
 
 import json
 import logging
-import math
 import sys
 import time
 from pathlib import Path
@@ -58,12 +60,12 @@ RUN_NAMES: Dict[str, str] = {
 }
 
 ENVIRONMENTS = [
-    "HalfCheetah-v5",
-    "Walker2d-v5",
     "Hopper-v5",
-    "Swimmer-v5",
-    "Ant-v5",
-    "Humanoid-v5",
+    # "HalfCheetah-v5",
+    # "Walker2d-v5",    
+    # "Swimmer-v5",
+    # "Ant-v5",
+    # "Humanoid-v5",
 ]
 
 TRAINING_SEEDS = [
@@ -91,6 +93,10 @@ TRAINING_SEEDS = [
 #
 # No historical maximum and no test return is used for selection.
 TERMINAL_WINDOW_STEPS = 200_000
+# Require enough evidence on the final causal branch so that a late checkpoint
+# restoration followed by only one or two observations cannot win by chance.
+MIN_TERMINAL_SUPPORT_STEPS = 100_000
+MIN_TERMINAL_POINTS = 3
 TARGET_TRAINING_STEPS = 2_000_000
 
 # ASHA: only full-budget trials are eligible for champion selection.
@@ -109,11 +115,12 @@ TEST_EPISODE_SEEDS = list(range(100_000, 100_000 + N_TEST_EPISODES))
 EXPLORE = False
 
 # Useful for a quick validation before launching the entire campaign.
-SMOKE_TEST = False
-SMOKE_ENV = "Walker2d-v5"
-SMOKE_TRAINING_SEED = 1042
-SMOKE_METHODS = ["PBT", "PB2", "ASHA", "CODA"]
-SMOKE_TEST_EPISODES = 30
+SMOKE_TEST = True
+SMOKE_ENV = "Hopper-v5"
+SMOKE_TRAINING_SEED = 2854 
+#SMOKE_METHODS = ["PBT", "PB2", "ASHA", "CODA"]
+SMOKE_METHODS = ["CODA"]
+SMOKE_TEST_EPISODES = 100
 
 # Output directory.
 TEST_OUTPUT_ROOT = RESULTS_ROOT / "heldout_test"
@@ -192,12 +199,27 @@ def _safe_numeric(series: pd.Series) -> pd.Series:
 
 
 def _chronological_worker_history(df: pd.DataFrame) -> pd.DataFrame:
-    """Recover within-worker causal execution order as robustly as possible."""
+    """Recover the actual causal execution order within one worker/trial.
+
+    Final-campaign files explicitly store ``causal_order``.  Prefer it over
+    training_iteration or timesteps_total, both of which may decrease or repeat
+    after population checkpoint inheritance.  The remaining fields are kept as
+    backward-compatible fallbacks for older metric files.
+    """
     out = df.copy()
     out["__row_order"] = np.arange(len(out), dtype=np.int64)
 
-    # time_total_s is preferred because training_iteration and timesteps_total
-    # may decrease/duplicate after checkpoint inheritance.
+    if "causal_order" in out.columns:
+        order = _safe_numeric(out["causal_order"])
+        if order.notna().all():
+            out["__order"] = order
+            return (
+                out.sort_values(["__order", "__row_order"], kind="stable")
+                .drop(columns=["__order"])
+                .reset_index(drop=True)
+            )
+
+    # Backward-compatible fallbacks for older outputs.
     if "time_total_s" in out.columns:
         order = _safe_numeric(out["time_total_s"])
         if order.notna().any():
@@ -360,9 +382,24 @@ def select_training_champion(
 
         score, t0, t1, n_pts, last_return = _terminal_time_weighted_score(worker_df)
 
+        terminal_support = (
+            float(t1 - t0)
+            if np.isfinite(t0) and np.isfinite(t1)
+            else np.nan
+        )
+
         if not np.isfinite(score):
             eligible = False
             eligibility_reason = "terminal training score unavailable"
+        elif (
+            not np.isfinite(terminal_support)
+            or terminal_support < MIN_TERMINAL_SUPPORT_STEPS
+        ):
+            eligible = False
+            eligibility_reason = "insufficient terminal branch support"
+        elif n_pts < MIN_TERMINAL_POINTS:
+            eligible = False
+            eligibility_reason = "insufficient terminal observations"
 
         rows.append(
             {
@@ -376,9 +413,7 @@ def select_training_champion(
                 "training_terminal_score": score,
                 "terminal_window_start": t0,
                 "terminal_window_end": t1,
-                "terminal_window_support": (
-                    t1 - t0 if np.isfinite(t0) and np.isfinite(t1) else np.nan
-                ),
+                "terminal_window_support": terminal_support,
                 "terminal_points": n_pts,
                 "last_training_return": last_return,
                 "checkpoint_exists": int(checkpoint_exists),
@@ -631,14 +666,21 @@ def main() -> None:
         "environments": envs,
         "training_seeds": training_seeds,
         "terminal_window_steps": TERMINAL_WINDOW_STEPS,
+        "minimum_terminal_support_steps": MIN_TERMINAL_SUPPORT_STEPS,
+        "minimum_terminal_points": MIN_TERMINAL_POINTS,
         "target_training_steps": TARGET_TRAINING_STEPS,
         "asha_require_full_budget": ASHA_REQUIRE_FULL_BUDGET,
         "n_test_episodes": len(test_seeds),
         "test_episode_seeds": list(map(int, test_seeds)),
         "explore": EXPLORE,
+        "terminal_checkpoint_requirement": (
+            "Training campaign saved checkpoint_at_end=True for every eligible trial."
+        ),
         "champion_selection": (
             "Highest time-weighted mean training return over the final "
-            "200k interactions of the final causal branch; test data are not used."
+            "200k interactions of the final causal branch, requiring at least "
+            "100k interactions of terminal support and at least 3 observations; "
+            "test data are never used for selection."
         ),
         "statistical_unit": "independent training seed",
     }
