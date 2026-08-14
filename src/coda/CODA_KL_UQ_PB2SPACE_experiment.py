@@ -1,5 +1,6 @@
+from __future__ import annotations
 
-
+# CPU limits must be set before NumPy / Ray / PyTorch imports.
 import os
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -28,7 +29,7 @@ from sklearn.exceptions import ConvergenceWarning
 import torch
 import torch.backends.cudnn as cudnn
 
-from coda_scheduler_HIM_PB2SPACE import CODAScheduler
+from coda_scheduler_KL_UQ_PB2SPACE import CODAScheduler
 
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
 logger = logging.getLogger(__name__)
@@ -61,60 +62,60 @@ ALGO_NAME = {
     "o2i": "CODA_O2I",
 }[VARIANT]
 
-# Keep smoke-test outputs separate from previous O2I prototypes.
-# Set CODA_RUN_TAG="" in the environment if you later want the canonical
-# filenames (e.g., metrics_CODA_seedXXXX.csv) for the final campaign.
-RUN_TAG = os.environ.get("CODA_RUN_TAG", "PB2SPACE").strip()
+# A distinct default tag prevents this pilot from overwriting the earlier HIM
+# campaign. Set CODA_RUN_TAG="PB2SPACE" only after freezing this design as the
+# final CODA version and rerunning all required seeds/baselines consistently.
+RUN_TAG = os.environ.get("CODA_RUN_TAG", "KL_UQ_PB2SPACE").strip()
 OUTPUT_NAME = f"{ALGO_NAME}_{RUN_TAG}" if RUN_TAG else ALGO_NAME
 
 METRIC = "env_runners/episode_return_mean"
 TIME_ATTR = "timesteps_total"
 
-# Reward context is normalized causally inside CODAScheduler; no task-specific
-# reward bounds are required.
 HYPERPARAM_BOUNDS = {
     "train_batch_size": [1000, 60000],
-    # RLlib's PPOConfig uses `lambda_`, but AlgorithmConfig.to_dict() exposes
-    # the Tune-compatible key as `lambda`. The scheduler therefore optimizes
-    # `lambda` in trial.config.
     "lambda": [0.90, 0.99],
     "clip_param": [0.10, 0.50],
     "lr": [1e-5, 1e-3],
 }
 
-# Value-function loss weighting is no longer part of the HPO search space.
-# Keep it fixed and identical across PBT/PB2/ASHA/CODA in the final campaign.
+# Common PPO controls shared with the final PBT/PB2/ASHA baselines.
 FIXED_VF_LOSS_COEFF = 0.5
+FIXED_GAMMA = 0.99
 
-# Entropy is NOT optimized. It is reserved exclusively as the O2I actuator.
+# O2I: normalized observed-GP uncertainty -> PPO entropy.
 BASE_ENTROPY_COEFF = 0.0
-O2I_ENTROPY_SCALE = 0.020
+O2I_UNCERTAINTY_SCALE = 0.008
 O2I_MAX_INCREMENT = 0.008
 ENTROPY_GUARD = 0.008
 
-# Surrogate/learner-state calibration. These tune existing CODA mechanisms;
-# they do not add new communication channels or optimization components.
+# I2O: KL-only policy-update state.
+POLICY_KL_REFERENCE = 0.01
+POLICY_STATE_MIN = 1e-6
+POLICY_STATE_EMA_BETA = 0.75
+
+# Surrogate controls.
 MIN_VALID_TRANSITIONS = 16
-STABILITY_EMA_BETA = 0.75
+MAX_GP_POINTS = 1000
+REWARD_Z_CLIP = 4.0
+
 
 # -----------------------------------------------------------------------------
-# Hopper smoke-test controls
+# Optional smoke-test controls
 # -----------------------------------------------------------------------------
-# Leave True for the Hopper validation run. Set False before the final campaign.
 HOPPER_SMOKE_TEST = False
 HOPPER_TEST_ENV = "Hopper-v5"
-HOPPER_TEST_SEEDS = [2222]
+HOPPER_TEST_SEEDS = [1042]
 
 
 # -----------------------------------------------------------------------------
-# Reproducibility / diagnostics callback
+# Callback: restore synchronization, KL-only I2O, and diagnostics
 # -----------------------------------------------------------------------------
-class CODACallback(DefaultCallbacks):
-    """Extract PPO diagnostics and maintain a lineage-consistent learner-state EMA."""
+class CODAKLUQCallback(DefaultCallbacks):
+    """Maintain a lineage-consistent KL-only policy-update state."""
 
     def __init__(self):
         super().__init__()
-        self._stability_ema: Optional[float] = None
+        self._policy_state_ema: Optional[float] = None
         self._last_lineage_generation: Optional[int] = None
         self._iter_count = 0
 
@@ -167,7 +168,6 @@ class CODACallback(DefaultCallbacks):
 
     @staticmethod
     def _algorithm_config_value(algorithm, key: str, default=np.nan):
-        """Read a scalar from either AlgorithmConfig or its legacy dict form."""
         cfg = algorithm.config
         attr_name = "lambda_" if key == "lambda" else key
 
@@ -203,16 +203,7 @@ class CODACallback(DefaultCallbacks):
                 return None
 
     def _sync_effective_hyperparams(self, algorithm) -> None:
-        """Re-apply Tune/PBT values after a donor checkpoint is restored.
-
-        Ray's old PPO stack may restore policy.config and the optimizer state
-        from the donor checkpoint after Tune has already installed the new PBT
-        config.  CODA keeps AlgorithmConfig as the source of truth and
-        re-applies only the scalar PPO quantities that can be overwritten by
-        that restore path.  PPO has a single main optimizer here, so only that
-        optimizer is updated; we intentionally do not blanket-overwrite every
-        optimizer an arbitrary policy might expose.
-        """
+        """Re-apply Tune values after a donor checkpoint restore."""
         policy = self._get_default_policy(algorithm)
         if policy is None:
             return
@@ -227,7 +218,8 @@ class CODACallback(DefaultCallbacks):
             self._algorithm_config_value(algorithm, "lambda", np.nan), np.nan
         )
         desired_entropy = self._safe_float(
-            self._algorithm_config_value(algorithm, "entropy_coeff", np.nan), np.nan
+            self._algorithm_config_value(algorithm, "entropy_coeff", np.nan),
+            np.nan,
         )
 
         policy_config = getattr(policy, "config", None)
@@ -263,7 +255,6 @@ class CODACallback(DefaultCallbacks):
                 pass
 
     def _audit_effective_hyperparams(self, algorithm, custom: dict) -> None:
-        """Record Tune-vs-policy values so restore mismatches are visible."""
         policy = self._get_default_policy(algorithm)
         if policy is None:
             return
@@ -277,13 +268,17 @@ class CODACallback(DefaultCallbacks):
                 self._algorithm_config_value(algorithm, "lr", np.nan), np.nan
             ),
             "clip_param": self._safe_float(
-                self._algorithm_config_value(algorithm, "clip_param", np.nan), np.nan
+                self._algorithm_config_value(algorithm, "clip_param", np.nan),
+                np.nan,
             ),
             "lambda": self._safe_float(
                 self._algorithm_config_value(algorithm, "lambda", np.nan), np.nan
             ),
             "entropy_coeff": self._safe_float(
-                self._algorithm_config_value(algorithm, "entropy_coeff", np.nan), np.nan
+                self._algorithm_config_value(
+                    algorithm, "entropy_coeff", np.nan
+                ),
+                np.nan,
             ),
         }
 
@@ -328,6 +323,7 @@ class CODACallback(DefaultCallbacks):
             )
             custom[f"coda_mismatch_{name}"] = mismatch
             mismatch_count += int(mismatch)
+
         custom["coda_effective_hp_mismatch_count"] = float(mismatch_count)
 
     def _apply_lineage_seed_if_needed(self, algorithm) -> None:
@@ -347,19 +343,14 @@ class CODACallback(DefaultCallbacks):
         seed = self._safe_float(
             bridge.get("lineage_ema_seed", np.nan), np.nan
         )
-        self._stability_ema = float(seed) if np.isfinite(seed) else None
+        self._policy_state_ema = float(seed) if np.isfinite(seed) else None
         self._last_lineage_generation = generation
 
     def on_checkpoint_loaded(self, *, algorithm, **kwargs):
-        # Critical on the legacy PPO stack: restore donor weights/state first,
-        # then re-apply the receiver's current Tune/PBT hyperparameters.
         self._sync_effective_hyperparams(algorithm)
         self._apply_lineage_seed_if_needed(algorithm)
 
     def on_train_result(self, *, algorithm, result: dict, **kwargs):
-        # Defensive re-sync: if a Ray version invokes checkpoint callbacks in a
-        # different order, this guarantees subsequent PPO iterations use the
-        # Tune config. It is also followed by an explicit effective-value audit.
         self._sync_effective_hyperparams(algorithm)
         self._apply_lineage_seed_if_needed(algorithm)
 
@@ -368,29 +359,34 @@ class CODACallback(DefaultCallbacks):
         learner_stats = self._extract_learner_stats(result)
         bridge = self._bridge_from_algorithm(algorithm)
 
-        # ---------------------------------------------------------------------
-        # Scheduler audit metadata
-        # ---------------------------------------------------------------------
-        custom["coda_o2i_intervention_magnitude"] = self._safe_float(
-            bridge.get("o2i_intervention_magnitude", 0.0), 0.0
+        # Scheduler/O2I audit metadata.
+        custom["coda_guided_update"] = float(
+            bool(bridge.get("guided_update", False))
         )
-        custom["coda_o2i_delta_train_batch_size"] = self._safe_float(
-            bridge.get("o2i_delta_train_batch_size", 0.0), 0.0
+        custom["coda_gp_data_count"] = self._safe_float(
+            bridge.get("gp_data_count", 0.0), 0.0
         )
-        custom["coda_o2i_delta_lambda"] = self._safe_float(
-            bridge.get("o2i_delta_lambda", 0.0), 0.0
+        custom["coda_o2i_uncertainty_raw_std"] = self._safe_float(
+            bridge.get("o2i_uncertainty_raw_std", 0.0), 0.0
         )
-        custom["coda_o2i_delta_lr"] = self._safe_float(
-            bridge.get("o2i_delta_lr", 0.0), 0.0
+        custom["coda_o2i_uncertainty_prior_std"] = self._safe_float(
+            bridge.get("o2i_uncertainty_prior_std", 0.0), 0.0
         )
-        custom["coda_o2i_delta_clip_param"] = self._safe_float(
-            bridge.get("o2i_delta_clip_param", 0.0), 0.0
+        custom["coda_o2i_uncertainty_normalized"] = self._safe_float(
+            bridge.get("o2i_uncertainty_normalized", 0.0), 0.0
+        )
+        custom["coda_o2i_kernel_variance"] = self._safe_float(
+            bridge.get("o2i_kernel_variance", 0.0), 0.0
+        )
+        custom["coda_o2i_acquisition_value"] = self._safe_float(
+            bridge.get("o2i_acquisition_value", np.nan), np.nan
+        )
+        custom["coda_o2i_reference_entropy_coeff"] = self._safe_float(
+            bridge.get("o2i_reference_entropy_coeff", BASE_ENTROPY_COEFF),
+            BASE_ENTROPY_COEFF,
         )
         custom["coda_entropy_increment"] = self._safe_float(
             bridge.get("entropy_increment", 0.0), 0.0
-        )
-        custom["coda_guided_update"] = float(
-            bool(bridge.get("guided_update", False))
         )
         custom["coda_base_entropy_coeff"] = self._safe_float(
             bridge.get("base_entropy_coeff", BASE_ENTROPY_COEFF),
@@ -404,21 +400,15 @@ class CODACallback(DefaultCallbacks):
             bridge.get("applied_entropy_coeff", np.nan), np.nan
         )
 
-        # ---------------------------------------------------------------------
-        # PPO learner-state diagnostic
-        # ---------------------------------------------------------------------
+        # KL-only I2O state. EV is logged only as an independent diagnostic.
         if learner_stats is None:
-            for key in (
-                "stability_index",
-                "stability_raw",
-                "actor_health",
-                "critic_health",
-                "policy_kl",
-                "vf_explained_var",
-                "policy_entropy",
-            ):
-                custom[key] = np.nan
-            custom["stability_valid"] = 0.0
+            custom["policy_update_state"] = np.nan
+            custom["policy_update_state_raw"] = np.nan
+            custom["policy_update_state_valid"] = 0.0
+            custom["policy_update_health"] = np.nan
+            custom["policy_kl"] = np.nan
+            custom["vf_explained_var"] = np.nan
+            custom["policy_entropy"] = np.nan
             return
 
         policy_kl = self._safe_float(
@@ -437,60 +427,49 @@ class CODACallback(DefaultCallbacks):
             )
         )
 
-        valid = bool(
-            np.isfinite(policy_kl)
-            and np.isfinite(vf_explained_var)
-        )
+        valid = bool(np.isfinite(policy_kl))
 
         if valid:
-            reference_kl = 0.01  # matches PPO kl_target below
-            actor_health = float(
+            policy_update_health = float(
                 np.exp(
                     -max(
                         0.0,
-                        max(policy_kl, 0.0) / reference_kl - 1.0,
+                        max(policy_kl, 0.0) / POLICY_KL_REFERENCE - 1.0,
                     )
                 )
             )
-
-            clipped_vf = float(
-                np.clip(vf_explained_var, -10.0, 1.0)
-            )
-            critic_health = float(
-                np.exp(-max(0.0, 1.0 - clipped_vf))
-            )
-
-            stability_raw = float(
+            policy_state_raw = float(
                 np.clip(
-                    actor_health * critic_health,
-                    1e-6,
+                    policy_update_health,
+                    POLICY_STATE_MIN,
                     1.0,
                 )
             )
 
-            beta = STABILITY_EMA_BETA
-            if self._stability_ema is None:
-                self._stability_ema = stability_raw
+            if self._policy_state_ema is None:
+                self._policy_state_ema = policy_state_raw
             else:
-                self._stability_ema = float(
-                    beta * self._stability_ema
-                    + (1.0 - beta) * stability_raw
+                self._policy_state_ema = float(
+                    POLICY_STATE_EMA_BETA * self._policy_state_ema
+                    + (1.0 - POLICY_STATE_EMA_BETA) * policy_state_raw
                 )
 
-            stability_index = float(
-                np.clip(self._stability_ema, 1e-6, 1.0)
+            policy_state = float(
+                np.clip(
+                    self._policy_state_ema,
+                    POLICY_STATE_MIN,
+                    1.0,
+                )
             )
         else:
-            actor_health = np.nan
-            critic_health = np.nan
-            stability_raw = np.nan
-            stability_index = np.nan
+            policy_update_health = np.nan
+            policy_state_raw = np.nan
+            policy_state = np.nan
 
-        custom["stability_index"] = stability_index
-        custom["stability_raw"] = stability_raw
-        custom["stability_valid"] = float(valid)
-        custom["actor_health"] = actor_health
-        custom["critic_health"] = critic_health
+        custom["policy_update_state"] = policy_state
+        custom["policy_update_state_raw"] = policy_state_raw
+        custom["policy_update_state_valid"] = float(valid)
+        custom["policy_update_health"] = policy_update_health
         custom["policy_kl"] = policy_kl
         custom["vf_explained_var"] = vf_explained_var
         custom["policy_entropy"] = policy_entropy
@@ -504,15 +483,14 @@ class CODACallback(DefaultCallbacks):
                     if hasattr(cfg, "entropy_coeff")
                     else float(cfg.get("entropy_coeff", np.nan))
                 )
-                intervention = custom["coda_o2i_intervention_magnitude"]
                 logger.info(
-                    "PPO diagnostics | KL=%.5f entropy=%.4f coeff=%.5f "
-                    "S=%.4f intervention=%.3f",
+                    "CODA KL-UQ | KL=%.5f state=%.4f U=%.4f "
+                    "entropy_coeff=%.5f mismatch=%d",
                     policy_kl,
-                    policy_entropy,
+                    policy_state,
+                    custom["coda_o2i_uncertainty_normalized"],
                     entropy_coeff,
-                    stability_index,
-                    intervention,
+                    int(custom.get("coda_effective_hp_mismatch_count", 0.0)),
                 )
             except Exception:
                 pass
@@ -551,32 +529,21 @@ def _save_metadata(
         "algorithm": ALGO_NAME,
         "run_name": OUTPUT_NAME,
         "variant": VARIANT,
+        "communication_design": "KL-only I2O + observed-GP-uncertainty O2I",
         "environment": env_name,
         "seed": int(seed),
         "population": int(POBLACION_B),
         "max_timesteps_per_worker": int(TIMESTEPS_MAX),
-        "reward_context_normalization": {
-            "method": "causal_robust_median_iqr",
-            "location": "median of past valid R_before values",
-            "scale": "IQR/1.349 with MAD/std fallbacks",
-            "z_clip": 4.0,
-            "mapped_interval": [0.0, 1.0],
-            "uses_future_information": False,
-        },
-        "hyperparameter_bounds": HYPERPARAM_BOUNDS,
-        "surrogate_hyperparameter_geometry": {
-            "lr": "log10",
-            "train_batch_size": "linear",
-            "lambda": "linear",
-            "clip_param": "linear",
-        },
-        "stability_ema_beta": STABILITY_EMA_BETA,
         "optimized_hyperparameters": [
-            "train_batch_size", "lambda", "clip_param", "lr"
+            "train_batch_size",
+            "lambda",
+            "clip_param",
+            "lr",
         ],
+        "hyperparameter_bounds": HYPERPARAM_BOUNDS,
+        "learning_rate_model_representation": "log10",
         "fixed_vf_loss_coeff": FIXED_VF_LOSS_COEFF,
-        "entropy_role": "O2I actuator only; excluded from outer-loop search",
-        "base_entropy_coeff": BASE_ENTROPY_COEFF,
+        "ppo_gamma": FIXED_GAMMA,
         "perturbation_interval": int(
             w_pb2_params.get("perturbation_interval", 50_000)
         ),
@@ -584,37 +551,64 @@ def _save_metadata(
             w_pb2_params.get("quantile_fraction", 0.25)
         ),
         "min_valid_transitions": MIN_VALID_TRANSITIONS,
-        "max_gp_points": 1000,
-        "o2i_feedback": {
-            "method": "normalized_hyperparameter_intervention_magnitude",
-            "reference_configuration":
-                "donor_latest_real_applied_configuration",
-            "proposal_configuration":
-                "nominal_pb2_proposal_over_batch_lambda_clip_lr",
-            "normalization_domain":
-                "outer_hyperparameter_model_bounds_only",
-            "aggregation":
-                "mean_absolute_normalized_coordinate_change",
-            "formula":
-                "mean_j(abs(h_pb2_norm_j-h_current_norm_j))",
-            "signal_range": [0.0, 1.0],
-            "uses_learner_state_directly": False,
-            "uses_gp_uncertainty": False,
+        "max_gp_points": MAX_GP_POINTS,
+        "reward_context_normalization": {
+            "method": "causal robust median/IQR",
+            "iqr_scale_factor": 1.349,
+            "mad_fallback_factor": 1.4826,
+            "z_clip": REWARD_Z_CLIP,
+            "uses_future_information": False,
+        },
+        "i2o_policy_update_state": {
+            "source": "PPO approximate policy KL only",
+            "reference_kl": POLICY_KL_REFERENCE,
+            "raw_mapping": "exp(-max(0, max(KL,0)/reference_kl - 1))",
+            "ema_beta": POLICY_STATE_EMA_BETA,
+            "lower_bound": POLICY_STATE_MIN,
+            "vf_explained_var_used_in_i2o": False,
+        },
+        "o2i_gp_uncertainty": {
+            "source_model": "TV-GP fitted only to completed real observations",
+            "pending_points_used_for_o2i": False,
+            "pending_points_used_for_batch_ucb_variance": True,
+            "reference_actuator_condition": "base entropy coefficient",
+            "raw_signal": "posterior predictive standard deviation",
+            "normalization": "posterior_std / sqrt(fitted_kernel_diagonal)",
+            "normalized_range": [0.0, 1.0],
+            "mapping": "base + min(max_increment, scale * normalized_uncertainty)",
+            "uncertainty_scale": O2I_UNCERTAINTY_SCALE,
+            "max_entropy_increment": O2I_MAX_INCREMENT,
+            "entropy_guard": ENTROPY_GUARD,
+            "base_entropy_coeff": BASE_ENTROPY_COEFF,
+            "reachable_entropy_domain": [
+                BASE_ENTROPY_COEFF,
+                BASE_ENTROPY_COEFF + O2I_MAX_INCREMENT,
+            ],
             "entropy_is_search_coordinate": False,
             "applied_entropy_is_gp_execution_feature": True,
+            "recomputed_after_executable_mapping": True,
         },
-        "o2i_entropy_scale": O2I_ENTROPY_SCALE,
-        "max_entropy_increment": (
-            O2I_MAX_INCREMENT
-            if VARIANT in {"full", "o2i"}
-            else 0.0
-        ),
-        "entropy_guard": ENTROPY_GUARD,
-        "effective_max_applied_entropy": (
-            BASE_ENTROPY_COEFF + O2I_MAX_INCREMENT
-            if VARIANT in {"full", "o2i"}
-            else BASE_ENTROPY_COEFF
-        ),
+        "ppo": {
+            "gamma": FIXED_GAMMA,
+            "grad_clip": 0.5,
+            "minibatch_size": 512,
+            "num_sgd_iter": 10,
+            "vf_clip_param": 10.0,
+            "use_kl_loss": True,
+            "kl_coeff": 0.2,
+            "kl_target": POLICY_KL_REFERENCE,
+            "fcnet_hiddens": [512, 512],
+            "fcnet_activation": "tanh",
+            "vf_share_layers": False,
+            "num_env_runners": 4,
+            "num_envs_per_env_runner": 8,
+            "observation_filter": "MeanStdFilter",
+            "num_gpus_per_trial": 0.2,
+        },
+        "checkpointing": {
+            "checkpoint_at_end": True,
+            "restore_hyperparameter_resynchronization": True,
+        },
         "versions": {
             "python": sys.version,
             "ray": ray.__version__,
@@ -629,10 +623,7 @@ def _save_metadata(
     }
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(payload, indent=2),
-        encoding="utf-8",
-    )
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def _build_ppo_config(env_name: str, seed: int) -> PPOConfig:
@@ -640,7 +631,7 @@ def _build_ppo_config(env_name: str, seed: int) -> PPOConfig:
         PPOConfig()
         .environment(env_name)
         .framework("torch")
-        .callbacks(CODACallback)
+        .callbacks(CODAKLUQCallback)
         .api_stack(
             enable_rl_module_and_learner=False,
             enable_env_runner_and_connector_v2=False,
@@ -653,22 +644,17 @@ def _build_ppo_config(env_name: str, seed: int) -> PPOConfig:
             observation_filter="MeanStdFilter",
         )
         .training(
-            # Keep these initial distributions identical across compared methods.
             train_batch_size=tune.randint(1000, 60001),
             lr=tune.loguniform(1e-5, 1e-3),
             lambda_=tune.uniform(0.90, 0.99),
             clip_param=tune.uniform(0.10, 0.50),
-            # Entropy is deliberately excluded from HPO and is controlled only
-            # by CODA's O2I intervention signal.
             entropy_coeff=BASE_ENTROPY_COEFF,
-            # Keep the value-function loss weight fixed; it is not part of the
-            # PB2-matched outer-loop search space.
             vf_loss_coeff=FIXED_VF_LOSS_COEFF,
             minibatch_size=512,
             use_kl_loss=True,
             kl_coeff=0.2,
-            kl_target=0.01,
-            gamma=0.99,
+            kl_target=POLICY_KL_REFERENCE,
+            gamma=FIXED_GAMMA,
             grad_clip=0.5,
             num_sgd_iter=10,
             vf_clip_param=10.0,
@@ -704,26 +690,28 @@ def _extract_metrics(
         "config/clip_param",
         "config/train_batch_size",
         "config/vf_loss_coeff",
+        "config/gamma",
         "info/learner/default_policy/learner_stats/kl",
         "info/learner/default_policy/learner_stats/entropy",
         "info/learner/default_policy/learner_stats/vf_explained_var",
         "info/learner/default_policy/learner_stats/policy_loss",
         "info/learner/default_policy/learner_stats/vf_loss",
-        "custom_metrics/stability_index",
-        "custom_metrics/stability_raw",
-        "custom_metrics/stability_valid",
-        "custom_metrics/actor_health",
-        "custom_metrics/critic_health",
+        "custom_metrics/policy_update_state",
+        "custom_metrics/policy_update_state_raw",
+        "custom_metrics/policy_update_state_valid",
+        "custom_metrics/policy_update_health",
         "custom_metrics/policy_kl",
         "custom_metrics/vf_explained_var",
         "custom_metrics/policy_entropy",
-        "custom_metrics/coda_o2i_intervention_magnitude",
-        "custom_metrics/coda_o2i_delta_train_batch_size",
-        "custom_metrics/coda_o2i_delta_lambda",
-        "custom_metrics/coda_o2i_delta_clip_param",
-        "custom_metrics/coda_o2i_delta_lr",
-        "custom_metrics/coda_entropy_increment",
         "custom_metrics/coda_guided_update",
+        "custom_metrics/coda_gp_data_count",
+        "custom_metrics/coda_o2i_uncertainty_raw_std",
+        "custom_metrics/coda_o2i_uncertainty_prior_std",
+        "custom_metrics/coda_o2i_uncertainty_normalized",
+        "custom_metrics/coda_o2i_kernel_variance",
+        "custom_metrics/coda_o2i_acquisition_value",
+        "custom_metrics/coda_o2i_reference_entropy_coeff",
+        "custom_metrics/coda_entropy_increment",
         "custom_metrics/coda_base_entropy_coeff",
         "custom_metrics/coda_nominal_entropy_coeff",
         "custom_metrics/coda_applied_entropy_coeff",
@@ -751,11 +739,9 @@ def _extract_metrics(
         if df is None or df.empty:
             continue
 
-        present = [
-            c for c in columns_wanted
-            if c in df.columns
-        ]
+        present = [c for c in columns_wanted if c in df.columns]
         out = df[present].copy()
+        out["causal_order"] = np.arange(len(out), dtype=np.int64)
         out["entorno"] = env_name
         out["semilla"] = seed
         out["agente_id"] = f"Agente_{idx + 1}"
@@ -763,7 +749,10 @@ def _extract_metrics(
 
     if frames:
         final = pd.concat(frames, ignore_index=True)
-
+        final = final.sort_values(
+            ["agente_id", "causal_order"],
+            kind="stable",
+        )
         output_path.parent.mkdir(parents=True, exist_ok=True)
         final.to_csv(output_path, index=False)
 
@@ -785,6 +774,7 @@ def _copy_final_checkpoints(
 
     for idx, result in enumerate(result_grid):
         if not result.checkpoint:
+            logger.warning("No final checkpoint for Agente_%s", idx + 1)
             continue
 
         raw = result.metrics or {}
@@ -795,10 +785,18 @@ def _copy_final_checkpoints(
                 "episode_return_mean", np.nan
             )
 
-        if not np.isfinite(float(reward)):
+        try:
+            reward_is_finite = np.isfinite(float(reward))
+        except (TypeError, ValueError):
+            reward_is_finite = False
+
+        if not reward_is_finite:
             reward = raw.get("episode_reward_mean", np.nan)
 
-        reward = float(reward) if reward is not None else np.nan
+        try:
+            reward = float(reward)
+        except (TypeError, ValueError):
+            reward = np.nan
 
         if np.isfinite(reward) and reward > best_reward:
             best_reward = reward
@@ -821,7 +819,7 @@ def _copy_final_checkpoints(
 
     if best_agent:
         print(
-            f"Best final worker: {best_agent} | "
+            f"Best final worker (diagnostic only): {best_agent} | "
             f"return={best_reward:.3f}"
         )
 
@@ -847,7 +845,6 @@ def run_experiment(
 
     scheduler = CODAScheduler(
         time_attr=TIME_ATTR,
-        # metric/mode are supplied by TuneConfig below.
         perturbation_interval=int(
             w_pb2_params.get("perturbation_interval", 50_000)
         ),
@@ -858,12 +855,12 @@ def run_experiment(
         context_bounds=context_bounds,
         variant=VARIANT,
         min_valid_transitions=MIN_VALID_TRANSITIONS,
-        max_gp_points=1000,
+        max_gp_points=MAX_GP_POINTS,
         base_entropy_coeff=BASE_ENTROPY_COEFF,
-        o2i_entropy_scale=O2I_ENTROPY_SCALE,
+        o2i_uncertainty_scale=O2I_UNCERTAINTY_SCALE,
         max_entropy_increment=O2I_MAX_INCREMENT,
         entropy_guard=ENTROPY_GUARD,
-        reward_z_clip=4.0,
+        reward_z_clip=REWARD_Z_CLIP,
         synch=False,
     )
 
@@ -902,9 +899,6 @@ def run_experiment(
                     f"{OUTPUT_NAME}_{env_name}_{seed}_{trial.trial_id}"
                 ),
             ),
-            # Use the legacy dict so RLlib exposes GAE lambda under the
-            # Tune-compatible key `lambda` (PPOConfig stores it internally as
-            # `lambda_`).
             param_space=ppo_config.to_dict(),
             run_config=tune.RunConfig(
                 name=f"{OUTPUT_NAME}_{env_name}_Seed{seed}",
@@ -936,14 +930,8 @@ def run_experiment(
             / env_name
             / f"scheduler_{OUTPUT_NAME}_seed{seed}.csv"
         )
-        scheduler_path.parent.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-        scheduler.data.to_csv(
-            scheduler_path,
-            index=False,
-        )
+        scheduler_path.parent.mkdir(parents=True, exist_ok=True)
+        scheduler.data.to_csv(scheduler_path, index=False)
 
         metadata_path = (
             Path("./results/metadata")
@@ -964,15 +952,13 @@ def run_experiment(
         )
 
         print(
-            f"Completed {OUTPUT_NAME}: "
-            f"{env_name}, seed={seed}"
+            f"Completed {OUTPUT_NAME}: {env_name}, seed={seed}"
         )
         return True
 
     except Exception as exc:
         print(
-            f"\nCRITICAL ERROR in {env_name}, "
-            f"seed={seed}: {exc}"
+            f"\nCRITICAL ERROR in {env_name}, seed={seed}: {exc}"
         )
         traceback.print_exc()
         return False
@@ -1020,9 +1006,7 @@ def main() -> None:
                 params,
             )
             if not ok:
-                failures.append(
-                    f"{env_name} - seed {seed}"
-                )
+                failures.append(f"{env_name} - seed {seed}")
             done += 1
             print(f"Global progress: {done}/{total}")
 

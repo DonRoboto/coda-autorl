@@ -1,58 +1,52 @@
-
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""CODA scheduler for Ray Tune / RLlib.
+"""CODA scheduler with KL-only I2O and GP-uncertainty O2I.
 
 Experimental variants
 ---------------------
-- ``full``: CODA (I2O contextual surrogate + O2I intervention-magnitude feedback)
-- ``i2o``:  CODA-I2O (contextual surrogate only)
-- ``o2i``:  CODA-O2I (PB2-style surrogate + O2I intervention-magnitude feedback)
+- ``full``: CODA (KL-based learner context + GP-uncertainty-to-entropy O2I)
+- ``i2o``:  CODA-I2O (KL-based learner context, fixed entropy baseline)
+- ``o2i``:  CODA-O2I (PB2-style context + GP-uncertainty-to-entropy O2I)
 
-O2I design: Hyperparameter Intervention Magnitude (HIM)
--------------------------------------------------------
-The outer optimizer adapts four coordinates only:
+Communication design
+--------------------
+I2O uses a single PPO diagnostic: approximate policy KL divergence.  The
+learner callback converts KL into a bounded policy-update state and maintains a
+lineage-consistent EMA.  Complete CODA and CODA-I2O supply the preceding reward
+and policy-update state as causal context to the outer TV-GP.
+
+O2I uses the posterior uncertainty of the completed-observation TV-GP.  For a
+candidate outer configuration h, uncertainty is evaluated under a fixed
+reference actuator condition (the entropy baseline a0):
+
+    U(h) = clip(sigma_obs([context, h, a0]) / sigma_prior([context, h, a0]),
+                0, 1).
+
+The reference condition avoids a self-referential definition in which entropy
+would determine the uncertainty that determines entropy.  The candidate's
+execution entropy is then generated deterministically from U(h), and the UCB
+acquisition evaluates the candidate under that induced entropy.  After the
+continuous candidate is converted to executable values, uncertainty and entropy
+are recomputed for the executable configuration.
+
+Only the GP fitted to completed real observations produces the O2I uncertainty
+message.  The auxiliary GP containing pending batch proposals is used solely to
+diversify UCB uncertainty during the current population event.
+
+The outer optimizer adapts exactly four PPO coordinates:
 
     train_batch_size, lambda (GAE), clip_param, lr.
 
-The entropy coefficient is deliberately excluded from the search space and is
-reserved as the O2I communication actuator.  After the contextual PB2 surrogate
-proposes h_new, CODA measures the intervention relative to the donor's latest
-applied outer-loop configuration h_current:
-
-    intervention = mean_j |h_new_norm[j] - h_current_norm[j]|.
-
-The signal is naturally bounded in [0, 1] and determines entropy directly:
-
-    entropy_coeff = base_entropy_coeff + min(max_increment,
-                                              o2i_entropy_scale * intervention).
-
-With the default base_entropy_coeff=0, entropy is generated only by the O2I
-channel.  Applied entropy is retained as an execution feature of the GP, but it
-is never an independently optimized coordinate.
-
-Design goals
-------------
-1. Keep population exploitation/checkpoint inheritance from Ray PBT/PB2.
-2. Build temporally aligned GP transitions using the *applied* configuration.
-3. Keep synthetic donor records out of GP training while using them as the
-   predecessor of the receiver's first post-exploitation observation.
-4. Normalize reward context causally with a task-agnostic robust transform.
-5. Match the original PB2 PPO search coordinates: batch size, GAE lambda, PPO clip, and learning rate; reserve entropy for O2I only.
-6. Include applied entropy as a non-search execution feature in GP observations.
-7. Preserve inherited outer-loop hyperparameters on fallback and reset the O2I
-   actuator to its fixed baseline when no current guided intervention exists.
-8. Seed the receiver's learner-state EMA from the donor state after cloning.
-9. Keep O2I independent of GP posterior-uncertainty scaling.
-10. Represent learning rate in log10 space inside the GP and HIM geometry,
-    while preserving the original executable lr values in RLlib configs.
+Entropy remains excluded from the acquisition search coordinates and is retained
+only as an execution feature.  Learning rate is represented in log10 space
+inside the GP geometry while RLlib receives the original executable value.
 """
 
 from __future__ import annotations
 
 import logging
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -84,7 +78,7 @@ logger = logging.getLogger(__name__)
 # -----------------------------------------------------------------------------
 
 def _trial_key(trial: Trial) -> str:
-    """Return the stable Tune trial identifier used in CODA's internal table."""
+    """Return the stable Tune trial identifier used in CODA's table."""
     trial_id = getattr(trial, "trial_id", None)
     return str(trial_id) if trial_id else str(trial)
 
@@ -128,9 +122,6 @@ def _denormalize(data: np.ndarray, limits: np.ndarray) -> np.ndarray:
     return data * (high - low) + low
 
 
-# Learning rate spans orders of magnitude and is initialized log-uniformly.
-# CODA therefore represents it in log10 space *inside* the surrogate/HIM
-# geometry.  RLlib still receives and executes the original positive lr value.
 _LOG_SCALE_HYPERPARAMS = frozenset({"lr"})
 
 
@@ -138,7 +129,7 @@ def _transform_hyperparameters(
     data: np.ndarray,
     names: Sequence[str],
 ) -> np.ndarray:
-    """Map raw executable HP values to CODA's internal model geometry."""
+    """Map executable HP values to CODA's internal model geometry."""
     arr = np.asarray(data, dtype=np.float64).copy()
     if arr.ndim == 1:
         arr = arr.reshape(1, -1)
@@ -159,7 +150,7 @@ def _inverse_transform_hyperparameters(
     data: np.ndarray,
     names: Sequence[str],
 ) -> np.ndarray:
-    """Map CODA's internal model coordinates back to executable HP values."""
+    """Map CODA model coordinates back to executable HP values."""
     arr = np.asarray(data, dtype=np.float64).copy()
     one_dimensional = arr.ndim == 1
     if one_dimensional:
@@ -239,7 +230,7 @@ def _normalize_context(
     *,
     reward_z_clip: float = 4.0,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Normalize CODA context coordinates using only pre-decision data."""
+    """Normalize CODA context using only pre-decision historical data."""
     X_context_raw = np.asarray(X_context_raw, dtype=np.float64)
     new_context_raw = np.asarray(new_context_raw, dtype=np.float64).reshape(-1)
 
@@ -314,76 +305,6 @@ def _cast_and_clip(value: float, template, bounds: Sequence[float]):
         return value
 
 
-
-def _normalized_intervention_magnitude(
-    current_config: Dict[str, float],
-    proposed_config: Dict[str, float],
-    model_bounds: Dict[str, Tuple[float, float]],
-) -> Tuple[float, Dict[str, float]]:
-    """Return mean absolute normalized hyperparameter intervention in [0, 1].
-
-    The comparison is performed only over the outer-loop optimized coordinates
-    and uses their GP model bounds.  Entropy is excluded because it is the O2I
-    actuator rather than an independently optimized hyperparameter.
-
-    Returns
-    -------
-    magnitude:
-        Mean absolute normalized coordinate change across all optimized
-        hyperparameters.
-    components:
-        Per-coordinate absolute normalized changes, each in [0, 1].
-    """
-    names = list(model_bounds.keys())
-    limits = _transformed_bounds(model_bounds, names)
-
-    current_raw = np.asarray(
-        [[current_config[name] for name in names]],
-        dtype=np.float64,
-    )
-    proposed_raw = np.asarray(
-        [[proposed_config[name] for name in names]],
-        dtype=np.float64,
-    )
-
-    if not np.all(np.isfinite(current_raw)):
-        raise ValueError("Current configuration contains non-finite values")
-    if not np.all(np.isfinite(proposed_raw)):
-        raise ValueError("Proposed configuration contains non-finite values")
-
-    current = _transform_hyperparameters(current_raw, names)
-    proposed = _transform_hyperparameters(proposed_raw, names)
-
-    current_norm = np.clip(
-        _normalize(current, limits),
-        0.0,
-        1.0,
-    )
-    proposed_norm = np.clip(
-        _normalize(proposed, limits),
-        0.0,
-        1.0,
-    )
-
-    deltas = np.abs(
-        proposed_norm - current_norm
-    ).reshape(-1)
-
-    components = {
-        name: float(delta)
-        for name, delta in zip(names, deltas)
-    }
-
-    magnitude = float(
-        np.clip(
-            np.mean(deltas),
-            0.0,
-            1.0,
-        )
-    )
-    return magnitude, components
-
-
 # -----------------------------------------------------------------------------
 # Transition construction
 # -----------------------------------------------------------------------------
@@ -395,13 +316,7 @@ def _prepare_gp_transitions(
     use_learner_context: bool,
     max_gp_points: int = 1000,
 ) -> Tuple[pd.DataFrame, list[str]]:
-    """Construct valid temporally aligned transitions for the GP.
-
-    The GP models both the four outer-loop optimized hyperparameters and the
-    applied entropy coefficient.  Entropy is an execution-only feature: it is
-    observed by the surrogate because it affects PPO outcomes, but it is never
-    an independently optimized acquisition coordinate.
-    """
+    """Construct temporally aligned, lineage-consistent GP transitions."""
     if data.empty:
         return pd.DataFrame(), []
 
@@ -416,8 +331,8 @@ def _prepare_gp_transitions(
         df["is_synthetic"] = False
     df["is_synthetic"] = df["is_synthetic"].fillna(False).astype(bool)
 
-    # Causal order is insertion order, not Time. Checkpoint inheritance may
-    # restore a smaller training counter than one previously seen by a receiver.
+    # Causal order is insertion order, not Time. Checkpoint inheritance can
+    # restore a smaller counter than one previously seen on a discarded branch.
     df = df.sort_values(
         ["Trial", "_insertion_order"], kind="mergesort"
     ).reset_index(drop=True)
@@ -425,8 +340,8 @@ def _prepare_gp_transitions(
 
     df["T_before"] = grouped["Time"].shift(1)
     df["R_before"] = grouped["Reward"].shift(1)
-    df["S_before"] = grouped["stability_index"].shift(1)
-    df["S_valid_before"] = grouped["stability_valid"].shift(1)
+    df["S_before"] = grouped["policy_update_state"].shift(1)
+    df["S_valid_before"] = grouped["policy_update_state_valid"].shift(1)
 
     df["time_change"] = df["Time"] - df["T_before"]
     df["reward_change"] = df["Reward"] - df["R_before"]
@@ -452,7 +367,9 @@ def _prepare_gp_transitions(
         & finite_inputs
     )
     if use_learner_context:
-        valid &= df["S_valid_before"].fillna(0.0).astype(float) >= 0.5
+        valid &= (
+            df["S_valid_before"].fillna(0.0).astype(float) >= 0.5
+        )
 
     transitions = (
         df.loc[valid]
@@ -467,7 +384,7 @@ def _prepare_gp_transitions(
 
 
 # -----------------------------------------------------------------------------
-# GP + acquisition
+# GP, uncertainty, and acquisition
 # -----------------------------------------------------------------------------
 
 def _fit_gp(
@@ -504,6 +421,102 @@ def _fit_gp(
     ) from last_error
 
 
+def _kernel_prior_variance(
+    model: GaussianProcessRegressor,
+    x: np.ndarray,
+    eps: float = 1e-12,
+) -> float:
+    """Return the fitted-kernel prior variance at x."""
+    x = np.asarray(x, dtype=np.float64).reshape(1, -1)
+    kernel = getattr(model, "kernel_", None)
+    if kernel is None:
+        return float("nan")
+
+    variance = np.nan
+    try:
+        variance = float(np.asarray(kernel.diag(x)).reshape(-1)[0])
+    except Exception:
+        try:
+            variance = float(np.asarray(kernel(x, x)).reshape(1, 1)[0, 0])
+        except Exception:
+            variance = np.nan
+
+    if not np.isfinite(variance) or variance < eps:
+        return float("nan")
+    return variance
+
+
+def _observed_uncertainty_signal(
+    observed_model: GaussianProcessRegressor,
+    fixed_context: np.ndarray,
+    hp_normalized: np.ndarray,
+    baseline_entropy_normalized: float,
+    *,
+    eps: float = 1e-12,
+) -> Tuple[float, float, float, float]:
+    """Return posterior std, prior std, normalized U, and prior variance.
+
+    The query uses the completed-observation GP and a fixed baseline entropy.
+    Pending batch points never enter this O2I signal.
+    """
+    hp = np.asarray(hp_normalized, dtype=np.float64).reshape(-1)
+    x_ref = np.concatenate(
+        [
+            np.asarray(fixed_context, dtype=np.float64).reshape(-1),
+            hp,
+            [float(baseline_entropy_normalized)],
+        ]
+    ).reshape(1, -1)
+
+    _, std = observed_model.predict(x_ref, return_std=True)
+    posterior_std = float(np.asarray(std).reshape(-1)[0])
+
+    prior_variance = _kernel_prior_variance(observed_model, x_ref, eps=eps)
+    if np.isfinite(prior_variance):
+        prior_std = float(np.sqrt(max(prior_variance, eps)))
+        normalized = float(
+            np.clip(posterior_std / (prior_std + eps), 0.0, 1.0)
+        )
+    else:
+        # Conservative fallback: if the fitted kernel cannot expose its prior
+        # scale, treat the selected point as maximally uncertain.
+        prior_std = float("nan")
+        normalized = 1.0
+
+    return posterior_std, prior_std, normalized, prior_variance
+
+
+@dataclass
+class _DecisionState:
+    observed_model: GaussianProcessRegressor
+    fixed_context: np.ndarray
+    hp_names: Tuple[str, ...]
+    hp_model_bounds: np.ndarray
+    baseline_entropy_normalized: float
+
+
+def _uncertainty_for_executable_config(
+    state: _DecisionState,
+    config: Dict[str, float],
+) -> Tuple[float, float, float, float]:
+    """Recompute O2I uncertainty for the executable outer configuration."""
+    raw = np.asarray(
+        [[config[name] for name in state.hp_names]], dtype=np.float64
+    )
+    transformed = _transform_hyperparameters(raw, state.hp_names)
+    normalized = np.clip(
+        _normalize(transformed, state.hp_model_bounds).reshape(-1),
+        0.0,
+        1.0,
+    )
+    return _observed_uncertainty_signal(
+        state.observed_model,
+        state.fixed_context,
+        normalized,
+        state.baseline_entropy_normalized,
+    )
+
+
 def _ucb_value(
     mean_model: GaussianProcessRegressor,
     variance_model: GaussianProcessRegressor,
@@ -511,7 +524,7 @@ def _ucb_value(
     hp_normalized: np.ndarray,
     candidate_model_transform,
 ) -> float:
-    """PB2 UCB using a deterministic transform from search to execution space."""
+    """PB2 UCB using a deterministic search-to-execution transform."""
     model_normalized = np.asarray(
         candidate_model_transform(np.asarray(hp_normalized, dtype=np.float64)),
         dtype=np.float64,
@@ -519,7 +532,7 @@ def _ucb_value(
     x = np.concatenate([fixed_context, model_normalized]).reshape(1, -1)
     mean = float(mean_model.predict(x).reshape(-1)[0])
     _, std = variance_model.predict(x, return_std=True)
-    variance = float(std.reshape(-1)[0] ** 2)
+    variance = float(np.asarray(std).reshape(-1)[0] ** 2)
 
     n_obs = int(getattr(mean_model, "X_train_", np.empty((0,))).shape[0])
     beta_t = 0.2 + max(0.0, np.log(0.4 * max(n_obs, 1)))
@@ -535,7 +548,7 @@ def _optimize_acquisition(
     candidate_model_transform,
     *,
     n_restarts: int = 10,
-) -> np.ndarray:
+) -> Tuple[np.ndarray, float]:
     """Optimize PB2 UCB over outer-loop coordinates only."""
     bounds = [(float(lo), float(hi)) for lo, hi in normalized_search_bounds]
     best_value = -np.inf
@@ -557,6 +570,8 @@ def _optimize_acquisition(
             options={"maxiter": 200},
         )
         theta = np.asarray(result.x, dtype=np.float64)
+        if not np.all(np.isfinite(theta)):
+            continue
         value = _ucb_value(
             mean_model,
             variance_model,
@@ -572,7 +587,7 @@ def _optimize_acquisition(
         raise RuntimeError(
             "CODA acquisition optimization failed to produce a candidate"
         )
-    return best_theta
+    return best_theta, float(best_value)
 
 
 def _select_config(
@@ -581,7 +596,6 @@ def _select_config(
     yraw: np.ndarray,
     current_nominal: Optional[np.ndarray],
     new_context: np.ndarray,
-    current_hyperparams: Dict[str, float],
     search_bounds: Dict[str, Tuple[float, float]],
     model_bounds: Dict[str, Tuple[float, float]],
     execution_feature_bounds: Dict[str, Tuple[float, float]],
@@ -590,25 +604,28 @@ def _select_config(
     use_o2i_feedback: bool,
     entropy_param: str,
     base_entropy_coeff: float,
-    o2i_entropy_scale: float,
+    o2i_uncertainty_scale: float,
     max_entropy_increment: float,
     entropy_guard: float,
     reward_z_clip: float = 4.0,
-) -> np.ndarray:
-    """Fit the TV-GP and return the nominal four-dimensional PB2 proposal.
+) -> Tuple[np.ndarray, _DecisionState, float]:
+    """Fit TV-GPs and return the nominal outer-loop proposal.
 
-    Applied entropy is included in GP observations as an execution feature, but
-    it is not a free acquisition coordinate.  For every candidate h, its entropy
-    feature is deterministically generated from HIM(h_current, h).
+    Historical applied entropy is retained as an execution feature.  For every
+    candidate h, the observed GP first computes normalized uncertainty under the
+    fixed baseline entropy.  That uncertainty determines candidate entropy, and
+    UCB evaluates h under the induced execution condition.
     """
     hp_names = list(search_bounds.keys())
     if list(model_bounds.keys()) != hp_names:
-        raise ValueError("search_bounds and model_bounds must have identical HP coordinates")
+        raise ValueError(
+            "search_bounds and model_bounds must have identical HP coordinates"
+        )
     if list(execution_feature_bounds.keys()) != [entropy_param]:
-        raise ValueError("CODA currently expects entropy as the sole execution feature")
+        raise ValueError(
+            "CODA currently expects entropy as the sole execution feature"
+        )
 
-    # Search/model bounds are expressed in raw executable units externally,
-    # but CODA uses log10 geometry for learning rate internally.
     search_vals = _transformed_bounds(search_bounds, hp_names)
     hp_model_vals = _transformed_bounds(model_bounds, hp_names)
     execution_vals = np.asarray(
@@ -641,10 +658,10 @@ def _select_config(
     X = np.hstack((X_context, X_execution))
     y = _standardize_response(yraw).reshape(-1, 1)
 
-    mean_model = _fit_gp(X, y)
+    observed_model = _fit_gp(X, y)
 
     if current_nominal is None or len(current_nominal) == 0:
-        variance_model = deepcopy(mean_model)
+        variance_model = deepcopy(observed_model)
     else:
         pending_raw = np.asarray(current_nominal, dtype=np.float64)
         pending_hp = _transform_hyperparameters(
@@ -662,12 +679,14 @@ def _select_config(
         y_aug = np.vstack((y, np.zeros((current_norm.shape[0], 1))))
         variance_model = _fit_gp(X_aug, y_aug)
 
-    current_hp_raw = np.asarray(
-        [[current_hyperparams[name] for name in hp_names]], dtype=np.float64
+    baseline_entropy = float(
+        np.clip(base_entropy_coeff, 0.0, entropy_guard)
     )
-    current_hp = _transform_hyperparameters(current_hp_raw, hp_names)
-    current_hp_norm = np.clip(
-        _normalize(current_hp, hp_model_vals).reshape(-1), 0.0, 1.0
+    baseline_entropy_norm = float(
+        _normalize(
+            np.asarray([[baseline_entropy]], dtype=np.float64),
+            execution_vals,
+        )[0, 0]
     )
 
     def candidate_model_transform(hp_norm: np.ndarray) -> np.ndarray:
@@ -676,20 +695,24 @@ def _select_config(
             raise ValueError("Candidate HP vector has incorrect dimensionality")
 
         hp_norm_clipped = np.clip(hp_norm, 0.0, 1.0)
+
         if use_o2i_feedback:
-            intervention = float(
-                np.clip(np.mean(np.abs(hp_norm_clipped - current_hp_norm)), 0.0, 1.0)
+            _, _, uncertainty, _ = _observed_uncertainty_signal(
+                observed_model,
+                fixed,
+                hp_norm_clipped,
+                baseline_entropy_norm,
             )
             increment = min(
                 float(max_entropy_increment),
-                float(o2i_entropy_scale) * intervention,
+                float(o2i_uncertainty_scale) * uncertainty,
             )
         else:
             increment = 0.0
 
         applied_entropy = float(
             np.clip(
-                float(base_entropy_coeff) + increment,
+                baseline_entropy + increment,
                 0.0,
                 float(entropy_guard),
             )
@@ -711,8 +734,8 @@ def _select_config(
             ((search_lo - model_lo) / denom, (search_hi - model_lo) / denom)
         )
 
-    xt_norm = _optimize_acquisition(
-        mean_model,
+    xt_norm, acquisition_value = _optimize_acquisition(
+        observed_model,
         variance_model,
         fixed,
         normalized_search_bounds,
@@ -722,15 +745,23 @@ def _select_config(
 
     xt_model = _denormalize(xt_norm, hp_model_vals).astype(np.float64)
     xt = _inverse_transform_hyperparameters(xt_model, hp_names)
-    return np.asarray(xt, dtype=np.float64)
+
+    state = _DecisionState(
+        observed_model=observed_model,
+        fixed_context=np.asarray(fixed, dtype=np.float64),
+        hp_names=tuple(hp_names),
+        hp_model_bounds=np.asarray(hp_model_vals, dtype=np.float64),
+        baseline_entropy_normalized=baseline_entropy_norm,
+    )
+    return np.asarray(xt, dtype=np.float64), state, acquisition_value
 
 
 # -----------------------------------------------------------------------------
 # Scheduler
 # -----------------------------------------------------------------------------
 
-class CODAScheduler(PopulationBasedTraining):
-    """CODA with the original PB2 PPO search coordinates and entropy reserved for O2I."""
+class CODAUncertaintyScheduler(PopulationBasedTraining):
+    """CODA with KL-only I2O and observed-GP-uncertainty O2I."""
 
     VALID_VARIANTS = {"full", "i2o", "o2i"}
 
@@ -751,9 +782,9 @@ class CODAScheduler(PopulationBasedTraining):
         max_gp_points: int = 1000,
         entropy_param: str = "entropy_coeff",
         base_entropy_coeff: float = 0.0,
-        o2i_entropy_scale: float = 0.005,
-        max_entropy_increment: float = 0.005,
-        entropy_guard: float = 0.05,
+        o2i_uncertainty_scale: float = 0.008,
+        max_entropy_increment: float = 0.008,
+        entropy_guard: float = 0.008,
         reward_z_clip: float = 4.0,
         log_config: bool = True,
         require_attrs: bool = True,
@@ -776,7 +807,7 @@ class CODAScheduler(PopulationBasedTraining):
         self.max_gp_points = int(max_gp_points)
         self.entropy_param = entropy_param
         self.base_entropy_coeff = float(base_entropy_coeff)
-        self.o2i_entropy_scale = float(o2i_entropy_scale)
+        self.o2i_uncertainty_scale = float(o2i_uncertainty_scale)
         self.max_entropy_increment = float(max_entropy_increment)
         self.entropy_guard = float(entropy_guard)
         self.reward_z_clip = float(reward_z_clip)
@@ -787,10 +818,12 @@ class CODAScheduler(PopulationBasedTraining):
             raise ValueError("reward_z_clip must be > 0")
         if self.base_entropy_coeff < 0:
             raise ValueError("base_entropy_coeff must be >= 0")
-        if self.o2i_entropy_scale < 0:
-            raise ValueError("o2i_entropy_scale must be >= 0")
+        if self.o2i_uncertainty_scale < 0:
+            raise ValueError("o2i_uncertainty_scale must be >= 0")
         if self.max_entropy_increment < 0:
             raise ValueError("max_entropy_increment must be >= 0")
+        if self.entropy_guard <= 0:
+            raise ValueError("entropy_guard must be > 0")
 
         super().__init__(
             time_attr=time_attr,
@@ -816,7 +849,6 @@ class CODAScheduler(PopulationBasedTraining):
             "hyperparam_bounds",
         )
 
-
         self._context_bounds = context_bounds or {}
         required_context = {"T_before"}
         if self.use_learner_context:
@@ -831,10 +863,6 @@ class CODAScheduler(PopulationBasedTraining):
             "context_bounds",
         )
 
-        # The outer GP search/model coordinates are exactly the four optimized
-        # hyperparameters. Entropy is excluded from search, but retained as an
-        # execution-only GP feature so observed responses are conditioned on the
-        # actual O2I actuator value used by PPO.
         self._model_bounds_flat = deepcopy(self._hyperparam_bounds_flat)
         max_applied_entropy = self.base_entropy_coeff + self.max_entropy_increment
         if max_applied_entropy > self.entropy_guard + 1e-12:
@@ -842,7 +870,6 @@ class CODAScheduler(PopulationBasedTraining):
                 "entropy_guard must be >= base_entropy_coeff + max increment"
             )
         if max_applied_entropy <= 0.0:
-            # A positive-width bound is required by affine normalization.
             max_applied_entropy = 1e-12
         self._execution_feature_bounds_flat = {
             self.entropy_param: [0.0, float(max_applied_entropy)]
@@ -870,18 +897,6 @@ class CODAScheduler(PopulationBasedTraining):
             columns += ["R_before", "S_before"]
         return columns
 
-    def _context_limits(self) -> np.ndarray:
-        """Fixed context limits for debugging/backward compatibility."""
-        names = [
-            name
-            for name in self._context_columns()
-            if name != "R_before"
-        ]
-        return np.asarray(
-            [self._context_bounds[name] for name in names],
-            dtype=np.float64,
-        ).T
-
     @staticmethod
     def _bridge(config: Dict) -> Dict:
         model = config.setdefault("model", {})
@@ -899,8 +914,6 @@ class CODAScheduler(PopulationBasedTraining):
         trial: Trial,
     ):
         filled = _fill_config(trial.config, self._hyperparam_bounds)
-        # Entropy is not an outer-loop search coordinate. Every trial starts from
-        # the same fixed actuator baseline and only CODA O2I may change it.
         trial.config[self.entropy_param] = float(self.base_entropy_coeff)
         trial.evaluated_params.update(flatten_dict(filled))
         self._set_trial_identity(trial.config, trial)
@@ -909,9 +922,15 @@ class CODAScheduler(PopulationBasedTraining):
         bridge.setdefault("lineage_generation", 0)
         bridge.setdefault("lineage_ema_seed", None)
         bridge.setdefault("guided_update", False)
-        bridge.setdefault("o2i_intervention_magnitude", 0.0)
-        for name in self._hyperparam_bounds_flat:
-            bridge.setdefault(f"o2i_delta_{name}", 0.0)
+        bridge.setdefault("gp_data_count", 0)
+        bridge.setdefault("o2i_uncertainty_raw_std", 0.0)
+        bridge.setdefault("o2i_uncertainty_prior_std", 0.0)
+        bridge.setdefault("o2i_uncertainty_normalized", 0.0)
+        bridge.setdefault("o2i_kernel_variance", 0.0)
+        bridge.setdefault("o2i_acquisition_value", None)
+        bridge.setdefault(
+            "o2i_reference_entropy_coeff", float(self.base_entropy_coeff)
+        )
         bridge.setdefault("entropy_increment", 0.0)
         bridge.setdefault("base_entropy_coeff", float(self.base_entropy_coeff))
         bridge.setdefault("nominal_entropy_coeff", float(self.base_entropy_coeff))
@@ -941,9 +960,9 @@ class CODAScheduler(PopulationBasedTraining):
                     return value
             return float(default)
 
-        stability_index = metric("stability_index")
-        stability_raw = metric("stability_raw")
-        stability_valid = metric("stability_valid", 0.0)
+        policy_state = metric("policy_update_state")
+        policy_state_raw = metric("policy_update_state_raw")
+        policy_state_valid = metric("policy_update_state_valid", 0.0)
 
         flat = flatten_dict(trial.config, prevent_delimiter=True)
         hp_names = list(self._hyperparam_bounds_flat.keys())
@@ -965,20 +984,33 @@ class CODAScheduler(PopulationBasedTraining):
             **dict(zip(hp_names, hp_values)),
             self.entropy_param: applied_entropy,
             "Reward": score,
-            "stability_index": stability_index,
-            "stability_raw": stability_raw,
-            "stability_valid": stability_valid,
+            "policy_update_state": policy_state,
+            "policy_update_state_raw": policy_state_raw,
+            "policy_update_state_valid": policy_state_valid,
             "is_synthetic": False,
             "guided_update": bool(bridge.get("guided_update", False)),
-            "o2i_intervention_magnitude": _safe_float(
-                bridge.get("o2i_intervention_magnitude", 0.0), 0.0
+            "gp_data_count": _safe_float(bridge.get("gp_data_count", 0), 0.0),
+            "o2i_uncertainty_raw_std": _safe_float(
+                bridge.get("o2i_uncertainty_raw_std", 0.0), 0.0
             ),
-            **{
-                f"o2i_delta_{name}": _safe_float(
-                    bridge.get(f"o2i_delta_{name}", 0.0), 0.0
-                )
-                for name in hp_names
-            },
+            "o2i_uncertainty_prior_std": _safe_float(
+                bridge.get("o2i_uncertainty_prior_std", 0.0), 0.0
+            ),
+            "o2i_uncertainty_normalized": _safe_float(
+                bridge.get("o2i_uncertainty_normalized", 0.0), 0.0
+            ),
+            "o2i_kernel_variance": _safe_float(
+                bridge.get("o2i_kernel_variance", 0.0), 0.0
+            ),
+            "o2i_acquisition_value": _safe_float(
+                bridge.get("o2i_acquisition_value", np.nan), np.nan
+            ),
+            "o2i_reference_entropy_coeff": _safe_float(
+                bridge.get(
+                    "o2i_reference_entropy_coeff", self.base_entropy_coeff
+                ),
+                self.base_entropy_coeff,
+            ),
             "entropy_increment": _safe_float(
                 bridge.get("entropy_increment", 0.0), 0.0
             ),
@@ -1036,16 +1068,24 @@ class CODAScheduler(PopulationBasedTraining):
             "Trial": _trial_key(receiver),
             "Time": donor_row["Time"],
             "Reward": donor_row["Reward"],
-            "stability_index": donor_row.get("stability_index", np.nan),
-            "stability_raw": donor_row.get("stability_raw", np.nan),
-            "stability_valid": donor_row.get("stability_valid", 0.0),
+            "policy_update_state": donor_row.get(
+                "policy_update_state", np.nan
+            ),
+            "policy_update_state_raw": donor_row.get(
+                "policy_update_state_raw", np.nan
+            ),
+            "policy_update_state_valid": donor_row.get(
+                "policy_update_state_valid", 0.0
+            ),
             "is_synthetic": True,
             "guided_update": False,
-            "o2i_intervention_magnitude": 0.0,
-            **{
-                f"o2i_delta_{name}": 0.0
-                for name in hp_names
-            },
+            "gp_data_count": 0.0,
+            "o2i_uncertainty_raw_std": 0.0,
+            "o2i_uncertainty_prior_std": 0.0,
+            "o2i_uncertainty_normalized": 0.0,
+            "o2i_kernel_variance": 0.0,
+            "o2i_acquisition_value": np.nan,
+            "o2i_reference_entropy_coeff": float(self.base_entropy_coeff),
             "entropy_increment": 0.0,
             "base_entropy_coeff": float(self.base_entropy_coeff),
             "nominal_entropy_coeff": float(self.base_entropy_coeff),
@@ -1072,17 +1112,16 @@ class CODAScheduler(PopulationBasedTraining):
         if self.use_learner_context:
             values += [
                 donor_row["Reward"],
-                donor_row["stability_index"],
+                donor_row["policy_update_state"],
             ]
         return np.asarray(values, dtype=np.float64)
-
 
     def _propose_from_gp(
         self,
         donor: Trial,
         donor_config_flat: Dict,
-    ) -> Tuple[Dict, bool, float, Dict[str, float]]:
-        """Return nominal PB2 proposal and HIM over optimized coordinates."""
+    ) -> Tuple[Dict, bool, float, float, float, float, float, int]:
+        """Return proposal plus observed-GP uncertainty diagnostics."""
         transitions, context_columns = _prepare_gp_transitions(
             self.data,
             self._hyperparam_bounds_flat,
@@ -1092,38 +1131,37 @@ class CODAScheduler(PopulationBasedTraining):
         )
 
         hp_names = list(self._hyperparam_bounds_flat.keys())
-        zero_components = {name: 0.0 for name in hp_names}
-
         donor_row = self._latest_trial_row(donor)
-        fallback = (deepcopy(donor_config_flat), False, 0.0, zero_components)
+        n_data = int(len(transitions))
+        fallback = (
+            deepcopy(donor_config_flat),
+            False,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            np.nan,
+            n_data,
+        )
 
         if donor_row is None:
             return fallback
-        if len(transitions) < self.min_valid_transitions:
+        if n_data < self.min_valid_transitions:
             return fallback
 
         new_context = self._new_context(donor_row)
         if not np.all(np.isfinite(new_context)):
             return fallback
 
-        current_observed = {
-            name: _safe_float(
-                donor_row.get(name, donor_config_flat[name]),
-                donor_config_flat[name],
-            )
-            for name in hp_names
-        }
-
         gp_inputs = context_columns + hp_names + [self.entropy_param]
         Xraw = transitions[gp_inputs].to_numpy(dtype=np.float64)
         yraw = transitions["y"].to_numpy(dtype=np.float64)
 
-        new_values = _select_config(
+        new_values, decision_state, acquisition_value = _select_config(
             Xraw=Xraw,
             yraw=yraw,
             current_nominal=self.current_nominal,
             new_context=new_context,
-            current_hyperparams=current_observed,
             search_bounds=self._hyperparam_bounds_flat,
             model_bounds=self._model_bounds_flat,
             execution_feature_bounds=self._execution_feature_bounds_flat,
@@ -1132,14 +1170,12 @@ class CODAScheduler(PopulationBasedTraining):
             use_o2i_feedback=self.use_o2i_feedback,
             entropy_param=self.entropy_param,
             base_entropy_coeff=self.base_entropy_coeff,
-            o2i_entropy_scale=self.o2i_entropy_scale,
+            o2i_uncertainty_scale=self.o2i_uncertainty_scale,
             max_entropy_increment=self.max_entropy_increment,
             entropy_guard=self.entropy_guard,
             reward_z_clip=self.reward_z_clip,
         )
 
-        # Convert the continuous BO output to the actual executable HP values
-        # before computing the final HIM used by the learner.
         new_flat = deepcopy(donor_config_flat)
         for idx, name in enumerate(hp_names):
             template = donor_config_flat[name]
@@ -1150,66 +1186,74 @@ class CODAScheduler(PopulationBasedTraining):
             )
 
         if self.use_o2i_feedback:
-            intervention_magnitude, components = (
-                _normalized_intervention_magnitude(
-                    current_observed,
+            raw_std, prior_std, uncertainty, kernel_variance = (
+                _uncertainty_for_executable_config(
+                    decision_state,
                     {name: new_flat[name] for name in hp_names},
-                    self._model_bounds_flat,
                 )
             )
         else:
-            intervention_magnitude = 0.0
-            components = zero_components
+            raw_std = 0.0
+            prior_std = 0.0
+            uncertainty = 0.0
+            kernel_variance = 0.0
 
         return (
             new_flat,
             True,
-            float(np.clip(intervention_magnitude, 0.0, 1.0)),
-            components,
+            float(raw_std),
+            float(prior_std),
+            float(np.clip(uncertainty, 0.0, 1.0)),
+            float(kernel_variance),
+            float(acquisition_value),
+            n_data,
         )
 
     def _apply_o2i_feedback(
         self,
         config: Dict,
         *,
-        intervention_magnitude: float,
-        intervention_components: Dict[str, float],
+        uncertainty_raw_std: float,
+        uncertainty_prior_std: float,
+        uncertainty_normalized: float,
+        kernel_variance: float,
+        acquisition_value: float,
+        gp_data_count: int,
         guided_update: bool,
     ) -> Dict:
-        """Use entropy exclusively as the O2I actuator.
-
-        Entropy is not selected by PB2. For a valid guided intervention:
-
-            I = mean_j |h_new_norm[j] - h_current_norm[j]|
-            entropy = base_entropy + min(max_increment, scale * I)
-
-        If no current guided O2I intervention exists, entropy is reset to the
-        fixed baseline. The inherited *outer-loop* hyperparameters remain
-        unchanged on fallback.
-        """
+        """Map completed-observation GP uncertainty to PPO entropy."""
         out = deepcopy(config)
         bridge = self._bridge(out)
 
         bridge["guided_update"] = bool(guided_update)
-        bridge["o2i_intervention_magnitude"] = float(
-            intervention_magnitude if guided_update else 0.0
+        bridge["gp_data_count"] = int(gp_data_count)
+        bridge["o2i_uncertainty_raw_std"] = float(
+            uncertainty_raw_std if guided_update else 0.0
+        )
+        bridge["o2i_uncertainty_prior_std"] = float(
+            uncertainty_prior_std if guided_update else 0.0
+        )
+        bridge["o2i_uncertainty_normalized"] = float(
+            uncertainty_normalized if guided_update else 0.0
+        )
+        bridge["o2i_kernel_variance"] = float(
+            kernel_variance if guided_update else 0.0
+        )
+        bridge["o2i_acquisition_value"] = (
+            float(acquisition_value)
+            if guided_update and np.isfinite(acquisition_value)
+            else None
         )
 
-        for name in self._hyperparam_bounds_flat:
-            bridge[f"o2i_delta_{name}"] = float(
-                intervention_components.get(name, 0.0) if guided_update else 0.0
-            )
-
         base_entropy = float(self.base_entropy_coeff)
+        bridge["o2i_reference_entropy_coeff"] = base_entropy
         bridge["base_entropy_coeff"] = base_entropy
-        # Kept for compatibility with earlier audit scripts. It now means the
-        # fixed pre-O2I baseline, not an outer-optimizer proposal.
         bridge["nominal_entropy_coeff"] = base_entropy
 
         if guided_update and self.use_o2i_feedback:
             increment = float(
-                self.o2i_entropy_scale
-                * np.clip(intervention_magnitude, 0.0, 1.0)
+                self.o2i_uncertainty_scale
+                * np.clip(uncertainty_normalized, 0.0, 1.0)
             )
             increment = float(min(self.max_entropy_increment, increment))
         else:
@@ -1245,13 +1289,13 @@ class CODAScheduler(PopulationBasedTraining):
         if donor_row is not None:
             valid = (
                 _safe_float(
-                    donor_row.get("stability_valid", 0.0), 0.0
+                    donor_row.get("policy_update_state_valid", 0.0), 0.0
                 )
                 >= 0.5
             )
             if valid:
                 seed = _safe_float(
-                    donor_row.get("stability_index", np.nan), np.nan
+                    donor_row.get("policy_update_state", np.nan), np.nan
                 )
         bridge["lineage_ema_seed"] = (
             float(seed) if np.isfinite(seed) else None
@@ -1262,7 +1306,7 @@ class CODAScheduler(PopulationBasedTraining):
         applied_flat: Dict,
         guided_update: bool,
     ) -> None:
-        """Store full execution-space proposals for PB2 batch diversification."""
+        """Store full execution-space proposals for batch diversification."""
         if not guided_update:
             return
 
@@ -1291,12 +1335,8 @@ class CODAScheduler(PopulationBasedTraining):
         trial: Trial,
         trial_to_clone: Trial,
     ) -> Tuple[Dict, Dict]:
-        donor_row = self._latest_trial_row(
-            trial_to_clone
-        )
+        donor_row = self._latest_trial_row(trial_to_clone)
 
-        # Always create the receiver's causal donor predecessor before checking
-        # whether the GP is ready.
         if donor_row is not None:
             self._append_lineage_anchor(
                 donor_row=donor_row,
@@ -1309,9 +1349,7 @@ class CODAScheduler(PopulationBasedTraining):
         )
 
         current_time = (
-            float(
-                self.data["Time"].max()
-            )
+            float(self.data["Time"].max())
             if not self.data.empty
             else -np.inf
         )
@@ -1321,20 +1359,26 @@ class CODAScheduler(PopulationBasedTraining):
         (
             nominal_flat,
             guided,
-            intervention_magnitude,
-            intervention_components,
+            uncertainty_raw_std,
+            uncertainty_prior_std,
+            uncertainty_normalized,
+            kernel_variance,
+            acquisition_value,
+            gp_data_count,
         ) = self._propose_from_gp(
             trial_to_clone,
             donor_flat,
         )
 
-        new_config = unflatten_dict(
-            nominal_flat
-        )
+        new_config = unflatten_dict(nominal_flat)
         new_config = self._apply_o2i_feedback(
             new_config,
-            intervention_magnitude=intervention_magnitude,
-            intervention_components=intervention_components,
+            uncertainty_raw_std=uncertainty_raw_std,
+            uncertainty_prior_std=uncertainty_prior_std,
+            uncertainty_normalized=uncertainty_normalized,
+            kernel_variance=kernel_variance,
+            acquisition_value=acquisition_value,
+            gp_data_count=gp_data_count,
             guided_update=guided,
         )
 
@@ -1350,5 +1394,6 @@ class CODAScheduler(PopulationBasedTraining):
         return new_config, {}
 
 
-# Backward-compatible alias if older scripts import W_PB2.
-W_PB2 = CODAScheduler
+# Convenient aliases for experiment scripts and older imports.
+CODAScheduler = CODAUncertaintyScheduler
+W_PB2 = CODAUncertaintyScheduler
