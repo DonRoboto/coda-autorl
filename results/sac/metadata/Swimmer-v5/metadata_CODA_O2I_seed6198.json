@@ -1,0 +1,137 @@
+{
+  "algorithm": "CODA_O2I",
+  "run_name": "CODA_O2I",
+  "variant": "o2i",
+  "environment": "Swimmer-v5",
+  "seed": 6198,
+  "population": 4,
+  "max_timesteps_per_worker": 1000000,
+  "perturbation_interval": 50000,
+  "quantile_fraction": 0.25,
+  "optimized_hyperparameters": [
+    "train_batch_size",
+    "tau",
+    "optimization/actor_learning_rate",
+    "optimization/critic_learning_rate"
+  ],
+  "hyperparameter_bounds": {
+    "train_batch_size": [
+      256,
+      2048
+    ],
+    "tau": [
+      0.001,
+      0.02
+    ],
+    "optimization": {
+      "actor_learning_rate": [
+        1e-05,
+        0.0003
+      ],
+      "critic_learning_rate": [
+        0.0001,
+        0.001
+      ]
+    }
+  },
+  "configuration_source": {
+    "environments": "configs/environments.py",
+    "seeds": "configs/seeds.py",
+    "sac": "configs/sac_config.py",
+    "scheduler": "src/coda/schedulers/coda_sac_scheduler_final.py"
+  },
+  "pb2_core": {
+    "kernel": "Ray TV_SquaredExp (isotropic; ARD disabled)",
+    "input_normalization": "Ray PB2 min-max normalize",
+    "response_standardization": "Ray PB2 standardize",
+    "history_selection": "Ray PB2 select_length with <=1000 rows",
+    "acquisition": "Ray PB2 UCB and multi-start L-BFGS-B",
+    "log_coordinate_transform": false,
+    "robust_reward_normalization": false
+  },
+  "surrogate_context": {
+    "full": [
+      "T",
+      "R_before",
+      "S_before"
+    ],
+    "i2o": [
+      "T",
+      "R_before",
+      "S_before"
+    ],
+    "o2i": [
+      "T",
+      "R_before"
+    ]
+  },
+  "i2o": {
+    "source": "median absolute SAC TD error",
+    "td_reference_ema_beta": 0.9,
+    "state_mapping": "exp(-max(0, TDmedian/(TDref+eps)-1)), then learner-state EMA",
+    "state_ema_beta": 0.75,
+    "state_lower_bound": 1e-06,
+    "td_eps": 1e-08,
+    "lineage_state_transfer": true,
+    "lineage_td_reference_transfer": true
+  },
+  "o2i": {
+    "signal": "donor-relative incremental observed-GP uncertainty",
+    "threshold": 0.1,
+    "warmup_start": 16,
+    "warmup_end": 64,
+    "actuator": "SAC target_entropy",
+    "action_dim": 2,
+    "base_target_entropy": -2.0,
+    "max_increment": 0.19999999999999996,
+    "actuator_bounds": [
+      -2.0,
+      -1.8
+    ],
+    "mapping": "base + min(max_increment, scale * U_effective), clipped to actuator bounds",
+    "alpha_remains_internally_optimized": true,
+    "entropy_learning_rate": 0.0003,
+    "target_entropy_is_search_coordinate": false,
+    "target_entropy_is_gp_execution_feature_only_when_o2i_active": true
+  },
+  "sac": {
+    "gamma": 0.99,
+    "initial_alpha": 1.0,
+    "n_step": 1,
+    "target_network_update_freq": 0,
+    "learning_starts": 1500,
+    "training_intensity": 4,
+    "twin_q": true,
+    "replay_buffer_type": "MultiAgentPrioritizedReplayBuffer",
+    "replay_buffer_capacity": 250000,
+    "store_buffer_in_checkpoints": true,
+    "model_hiddens": [
+      256,
+      256
+    ],
+    "model_activation": "relu",
+    "num_env_runners": 4,
+    "num_envs_per_env_runner": 8,
+    "rollout_fragment_length": 8,
+    "min_sample_timesteps_per_iteration": 4000,
+    "observation_filter": "MeanStdFilter",
+    "num_gpus_per_trial": 0.2,
+    "old_api_stack": true
+  },
+  "checkpointing": {
+    "checkpoint_at_end": true,
+    "store_buffer_in_checkpoints": true,
+    "restore_hyperparameter_resynchronization": true
+  },
+  "versions": {
+    "python": "3.11.15 | packaged by conda-forge | (main, Mar  5 2026, 16:45:40) [GCC 14.3.0]",
+    "ray": "2.55.1",
+    "torch": "2.5.1+cu121",
+    "numpy": "2.4.4",
+    "pandas": "3.0.2",
+    "scikit-learn": "1.8.0",
+    "scipy": "1.17.1",
+    "gymnasium": "1.2.2",
+    "mujoco": "3.8.0"
+  }
+}

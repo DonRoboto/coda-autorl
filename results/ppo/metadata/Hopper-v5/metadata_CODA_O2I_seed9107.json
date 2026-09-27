@@ -1,0 +1,118 @@
+{
+  "algorithm": "CODA_O2I",
+  "run_name": "CODA_O2I",
+  "variant": "o2i",
+  "communication_design": "PB2 core + [T,R] performance context + gated donor-relative O2I",
+  "context_coordinates": [
+    "T",
+    "R"
+  ],
+  "i2o_enabled": false,
+  "o2i_enabled": true,
+  "environment": "Hopper-v5",
+  "seed": 9107,
+  "population": 4,
+  "max_timesteps_per_worker": 2000000,
+  "optimized_hyperparameters": [
+    "train_batch_size",
+    "lambda",
+    "clip_param",
+    "lr"
+  ],
+  "hyperparameter_bounds": {
+    "train_batch_size": [
+      1000,
+      60000
+    ],
+    "lambda": [
+      0.9,
+      0.99
+    ],
+    "clip_param": [
+      0.1,
+      0.5
+    ],
+    "lr": [
+      1e-05,
+      0.001
+    ]
+  },
+  "configuration_source": {
+    "environments": "configs/environments.py",
+    "seeds": "configs/seeds.py",
+    "ppo": "/home/yor5/Documents/GitHub/CODA/configs/ppo_config.py",
+    "scheduler": "src/coda/schedulers/coda_ppo_scheduler_final.py"
+  },
+  "pb2_core": {
+    "kernel": "Ray TV_SquaredExp (isotropic; ARD disabled)",
+    "input_normalization": "Ray PB2 min-max normalize",
+    "response_standardization": "Ray PB2 standardize",
+    "history_selection": "Ray PB2 select_length with <=1000 rows",
+    "acquisition": "Ray PB2 UCB and multi-start L-BFGS-B",
+    "log_coordinate_transform": false,
+    "robust_reward_normalization": false
+  },
+  "learning_rate_model_representation": "native PB2 coordinate; no CODA log10 transform",
+  "fixed_vf_loss_coeff": 0.5,
+  "ppo_gamma": 0.99,
+  "perturbation_interval": 50000,
+  "quantile_fraction": 0.25,
+  "i2o_policy_update_state": {
+    "source": "PPO approximate policy KL only",
+    "reference_kl": 0.01,
+    "raw_mapping": "exp(-max(0, max(KL,0)/reference_kl - 1))",
+    "ema_beta": 0.75,
+    "lower_bound": 1e-06,
+    "vf_explained_var_used_in_i2o": false
+  },
+  "o2i_incremental_gp_uncertainty": {
+    "definition": "donor-relative posterior uncertainty with threshold and observation-count warm-up",
+    "raw_signal": "clip(max(sigma_candidate - sigma_donor, 0) / (sigma_prior + eps), 0, 1)",
+    "threshold": 0.1,
+    "warmup_start_observations": 16,
+    "warmup_end_observations": 64,
+    "effective_signal": "thresholded_uncertainty * warmup_gain",
+    "mapping": "base + min(max_increment, scale * effective_uncertainty)",
+    "uncertainty_scale": 0.004,
+    "max_entropy_increment": 0.004,
+    "entropy_guard": 0.004,
+    "base_entropy_coeff": 0.0,
+    "entropy_is_search_coordinate": false,
+    "entropy_is_gp_execution_feature_only_when_o2i_active": true
+  },
+  "ppo": {
+    "gamma": 0.99,
+    "grad_clip": 0.5,
+    "minibatch_size": 512,
+    "num_sgd_iter": 10,
+    "vf_clip_param": 10.0,
+    "use_kl_loss": true,
+    "kl_coeff": 0.2,
+    "kl_target": 0.01,
+    "fcnet_hiddens": [
+      512,
+      512
+    ],
+    "fcnet_activation": "tanh",
+    "vf_share_layers": false,
+    "num_env_runners": 4,
+    "num_envs_per_env_runner": 8,
+    "observation_filter": "MeanStdFilter",
+    "num_gpus_per_trial": 0.2
+  },
+  "checkpointing": {
+    "checkpoint_at_end": true,
+    "restore_hyperparameter_resynchronization": true
+  },
+  "versions": {
+    "python": "3.11.15 | packaged by conda-forge | (main, Mar  5 2026, 16:45:40) [GCC 14.3.0]",
+    "ray": "2.55.1",
+    "torch": "2.5.1+cu121",
+    "numpy": "2.4.4",
+    "pandas": "3.0.2",
+    "scikit-learn": "1.8.0",
+    "scipy": "1.17.1",
+    "gymnasium": "1.2.2",
+    "mujoco": "3.8.0"
+  }
+}
