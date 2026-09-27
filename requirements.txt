@@ -1,0 +1,12 @@
+# Lightweight environment for reproducing the archived analyses and figures.
+#
+# Exact versions below were captured in CODA run metadata where available.
+# Exact matplotlib/statsmodels versions were not stored in the run metadata,
+# so bounded compatible versions are used rather than inventing a pin.
+
+numpy==2.4.4
+pandas==3.0.2
+scipy==1.17.1
+scikit-learn==1.8.0
+statsmodels>=0.14.4,<0.15
+matplotlib>=3.8,<4

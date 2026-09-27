@@ -4,7 +4,7 @@
 """
 Exploratory 2x2 factorial interaction analysis for CODA.
 
-The four cells are:
+The four method cells are:
 
                  O2I = 0           O2I = 1
     I2O = 0      PB2               CODA-O2I
@@ -18,73 +18,156 @@ For each learner g, environment e, and matched training seed s:
       - G_CODA-O2I
       + G_PB2
 
-This is a seed-level difference-in-differences contrast.
+This is a seed-level difference-in-differences contrast on the
+held-out-return scale.
 
 Positive I:
-    positive / super-additive interaction on the held-out-return scale.
+    positive departure from additivity.
 
 Negative I:
-    sub-additive interaction on the held-out-return scale.
+    negative departure from additivity.
 
-I approximately 0:
-    no detectable departure from additivity on that scale.
+I = 0:
+    no seed-level departure from additivity on this scale.
 
 The script:
-1. Reads PPO and SAC held-out ZIP files.
-2. Locates exactly one heldout_test_seed_summary.csv in each ZIP.
-3. Normalizes method labels.
-4. Verifies one observation per method x environment x training seed.
-5. Computes the interaction contrast for each matched seed.
-6. Reports median, unadjusted 95% percentile bootstrap CI, W/T/L,
-   two-sided paired Wilcoxon signed-rank p-value, and rank-biserial effect.
-7. Applies Holm correction across the eight learner-environment
-   interaction hypotheses.
-8. Saves both seed-level and summary CSV files.
 
-Expected summary columns:
-    method
-    environment
-    training_seed
-    test_mean_return
+1. Reads episode-level PPO and SAC held-out evaluation data.
+2. Normalizes supported method aliases.
+3. Validates the held-out evaluation protocol.
+4. Computes one held-out mean return per training seed.
+5. Verifies complete matched 2x2 data for every learner/environment.
+6. Computes the factorial interaction contrast for each matched seed.
+7. Reports:
+   - median interaction contrast,
+   - unadjusted percentile 95% paired-bootstrap CI,
+   - positive/zero/negative seed-level contrast counts,
+   - two-sided Wilcoxon signed-rank test,
+   - matched-pairs rank-biserial correlation.
+8. Applies Holm correction across the eight exploratory
+   learner-environment interaction hypotheses.
+9. Saves auditable seed-level and summary outputs.
+10. Generates the LaTeX table body used by the manuscript/supplement.
 
-Example
+Expected repository layout
+--------------------------
+
+coda-autorl/
+├── analysis/
+│   └── coda_factorial_interaction.py
+└── results/
+    ├── ppo/
+    │   └── heldout_reward_ppo_final/
+    │       └── heldout_test_episodes.csv
+    └── sac/
+        └── heldout_reward_sac_final/
+            └── heldout_test_episodes.csv
+
+Outputs
 -------
-python analysis/coda_factorial_interaction.py \
-    --ppo heldout_stability_ppo_final.zip \
-    --sac heldout_stability_sac_final.zip \
-    --output-dir results/statistics/factorial_interaction
+
+results/analysis/factorial_interaction/
+├── factorial_interaction_seed_level.csv
+├── factorial_interaction_seed_counts.csv
+├── factorial_interaction_summary.csv
+└── factorial_interaction_table_body.tex
 """
 
-from __future__ import annotations
-
-import argparse
-import zipfile
 from pathlib import Path
-from typing import Dict, Iterable, Tuple
 
 import numpy as np
 import pandas as pd
+import scipy
 from scipy.stats import rankdata, wilcoxon
 from statsmodels.stats.multitest import multipletests
 
 
-# =============================================================================
-# Reproducibility
-# =============================================================================
+# ============================================================
+# Paths
+# ============================================================
+
+# Works when this file is stored under:
+#     <repo_root>/analysis/coda_factorial_interaction.py
+#
+# The fallback also allows execution from an interactive session.
+if "__file__" in globals():
+    SCRIPT_DIR = Path(__file__).resolve().parent
+else:
+    SCRIPT_DIR = Path.cwd()
+
+REPO_ROOT = SCRIPT_DIR.parent
+
+PPO_HELDOUT = (
+    REPO_ROOT
+    / "results"
+    / "ppo"
+    / "heldout_reward_ppo_final"
+    / "heldout_test_episodes.csv"
+)
+
+SAC_HELDOUT = (
+    REPO_ROOT
+    / "results"
+    / "sac"
+    / "heldout_reward_sac_final"
+    / "heldout_test_episodes.csv"
+)
+
+OUTPUT_DIR = (
+    REPO_ROOT
+    / "results"
+    / "analysis"
+    / "factorial_interaction"
+)
+
+OUTPUT_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+OUTPUT_SEED_LEVEL = (
+    OUTPUT_DIR
+    / "factorial_interaction_seed_level.csv"
+)
+
+OUTPUT_SEED_COUNTS = (
+    OUTPUT_DIR
+    / "factorial_interaction_seed_counts.csv"
+)
+
+OUTPUT_SUMMARY = (
+    OUTPUT_DIR
+    / "factorial_interaction_summary.csv"
+)
+
+OUTPUT_LATEX = (
+    OUTPUT_DIR
+    / "factorial_interaction_table_body.tex"
+)
+
+
+# ============================================================
+# Analysis configuration
+# ============================================================
+
+N_TEST_EPISODES = 100
+N_TRAINING_SEEDS = 10
 
 N_BOOT = 10_000
 BOOT_SEED = 20260913
 ALPHA = 0.05
-EXPECTED_SEEDS = 10
 
-ENV_ORDER = [
+LEARNERS = [
+    "PPO",
+    "SAC",
+]
+
+ENVIRONMENTS = [
     "HalfCheetah-v5",
     "Hopper-v5",
     "Swimmer-v5",
     "Walker2d-v5",
 ]
-
-LEARNER_ORDER = ["PPO", "SAC"]
 
 REQUIRED_METHODS = [
     "PB2",
@@ -93,18 +176,14 @@ REQUIRED_METHODS = [
     "CODA",
 ]
 
-
-# =============================================================================
-# Method-name normalization
-# =============================================================================
-
-METHOD_ALIASES: Dict[str, str] = {
+METHOD_ALIASES = {
     # PB2
     "PB2": "PB2",
 
     # Full CODA
     "CODA": "CODA",
     "CODA_FULL": "CODA",
+    "CODA-FULL": "CODA",
     "FULL": "CODA",
 
     # I2O-only
@@ -123,211 +202,588 @@ METHOD_ALIASES: Dict[str, str] = {
 }
 
 
-def canonical_method_name(value: str) -> str:
-    key = str(value).strip()
+# ============================================================
+# Input loading
+# ============================================================
+
+def canonical_method_name(value):
+    """
+    Normalize supported historical method aliases.
+    """
+    key = str(
+        value
+    ).strip()
+
+    if key in METHOD_ALIASES:
+        return METHOD_ALIASES[
+            key
+        ]
+
     key_upper = key.upper()
 
-    # Exact dictionary lookup first.
-    if key in METHOD_ALIASES:
-        return METHOD_ALIASES[key]
-
-    # Then case-insensitive lookup.
     for alias, canonical in METHOD_ALIASES.items():
+
         if alias.upper() == key_upper:
             return canonical
 
     return key
 
 
-# =============================================================================
-# Input
-# =============================================================================
-
-def read_summary(zip_path: Path) -> pd.DataFrame:
+def load_heldout(
+    path,
+    learner,
+):
     """
-    Read exactly one heldout_test_seed_summary.csv from a ZIP archive.
+    Load one episode-level held-out evaluation file and attach
+    its learner label.
     """
-    zip_path = Path(zip_path)
+    path = Path(
+        path
+    )
 
-    if not zip_path.exists():
-        raise FileNotFoundError(zip_path)
-
-    if zip_path.suffix.lower() != ".zip":
-        raise ValueError(
-            f"{zip_path} is not a ZIP file. "
-            "This script expects the held-out evaluation archive."
+    if not path.exists():
+        raise FileNotFoundError(
+            "Held-out evaluation file not found:\n"
+            f"{path}"
         )
 
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        names = [
-            name
-            for name in zf.namelist()
-            if name.endswith("heldout_test_seed_summary.csv")
-        ]
+    df = pd.read_csv(
+        path
+    )
 
-        if len(names) != 1:
-            raise RuntimeError(
-                f"Expected exactly one heldout_test_seed_summary.csv "
-                f"inside {zip_path}; found {len(names)}: {names}"
-            )
-
-        with zf.open(names[0]) as f:
-            df = pd.read_csv(f)
-
-    required_columns = {
+    required = {
         "method",
         "environment",
         "training_seed",
-        "test_mean_return",
+        "test_return",
     }
 
-    missing = required_columns.difference(df.columns)
+    missing = (
+        required
+        - set(
+            df.columns
+        )
+    )
 
     if missing:
-        raise KeyError(
-            f"{zip_path} is missing required columns: {sorted(missing)}\n"
-            f"Available columns: {list(df.columns)}"
+        raise ValueError(
+            f"{path.name} is missing required columns: "
+            f"{sorted(missing)}"
         )
 
     df = df.copy()
-    df["method"] = df["method"].map(canonical_method_name)
-    df["environment"] = df["environment"].astype(str)
-    df["training_seed"] = pd.to_numeric(
-        df["training_seed"],
-        errors="raise",
-    ).astype(int)
 
-    df["test_mean_return"] = pd.to_numeric(
-        df["test_mean_return"],
-        errors="coerce",
+    df[
+        "learner"
+    ] = learner
+
+    df[
+        "method"
+    ] = (
+        df[
+            "method"
+        ]
+        .map(
+            canonical_method_name
+        )
     )
 
-    if df["test_mean_return"].isna().any():
-        bad = df[df["test_mean_return"].isna()]
+    df[
+        "training_seed"
+    ] = pd.to_numeric(
+        df[
+            "training_seed"
+        ],
+        errors="raise",
+    ).astype(
+        int
+    )
+
+    df[
+        "test_return"
+    ] = pd.to_numeric(
+        df[
+            "test_return"
+        ],
+        errors="raise",
+    )
+
+    if not np.isfinite(
+        df[
+            "test_return"
+        ]
+    ).all():
+
         raise ValueError(
-            "Non-finite test_mean_return values were found:\n"
-            f"{bad[['method', 'environment', 'training_seed']].to_string(index=False)}"
+            f"{path.name} contains non-finite "
+            "test_return values."
         )
+
+    # Retain only the 2x2 factorial cells.
+    df = df[
+        df[
+            "method"
+        ].isin(
+            REQUIRED_METHODS
+        )
+    ].copy()
 
     return df
 
 
-# =============================================================================
-# Statistical helpers
-# =============================================================================
+# ============================================================
+# Held-out protocol validation
+# ============================================================
 
-def rank_biserial(differences: Iterable[float]) -> float:
+def validate_episode_level_data(
+    episodes,
+):
     """
-    Matched-pairs rank-biserial correlation.
-
-    r_rb = (W+ - W-) / (W+ + W-)
-
-    Zero differences are removed, matching the Wilcoxon zero_method='wilcox'
-    convention.
+    Validate episode counts, optional common evaluation seeds,
+    champion identity, and explore=False.
     """
-    d = np.asarray(list(differences), dtype=float)
-    d = d[np.isfinite(d)]
-    d = d[d != 0.0]
-
-    if d.size == 0:
-        return 0.0
-
-    ranks = rankdata(
-        np.abs(d),
-        method="average",
+    observed_methods = set(
+        episodes[
+            "method"
+        ].unique()
     )
 
-    w_plus = float(ranks[d > 0].sum())
-    w_minus = float(ranks[d < 0].sum())
+    missing_methods = (
+        set(
+            REQUIRED_METHODS
+        )
+        - observed_methods
+    )
 
-    denom = w_plus + w_minus
+    if missing_methods:
 
-    if denom == 0.0:
-        return 0.0
+        raise ValueError(
+            "Missing factorial methods in held-out data: "
+            f"{sorted(missing_methods)}"
+        )
 
-    return (w_plus - w_minus) / denom
+    case_keys = [
+        "learner",
+        "method",
+        "environment",
+        "training_seed",
+    ]
+
+    # --------------------------------------------------------
+    # Exactly 100 held-out episodes per case
+    # --------------------------------------------------------
+
+    episode_counts = (
+        episodes
+        .groupby(
+            case_keys,
+            as_index=False,
+        )
+        .agg(
+            n_test_episodes=(
+                "test_return",
+                "size",
+            )
+        )
+    )
+
+    bad_episode_counts = episode_counts[
+        episode_counts[
+            "n_test_episodes"
+        ]
+        != N_TEST_EPISODES
+    ]
+
+    if not bad_episode_counts.empty:
+
+        print(
+            "\nCases with incorrect held-out episode count:"
+        )
+
+        print(
+            bad_episode_counts.to_string(
+                index=False
+            )
+        )
+
+        raise RuntimeError(
+            "Expected exactly "
+            f"{N_TEST_EPISODES} held-out episodes "
+            "per factorial cell and training seed."
+        )
+
+    # --------------------------------------------------------
+    # Optional validation: 100 unique held-out seeds
+    # --------------------------------------------------------
+
+    if (
+        "test_seed"
+        in episodes.columns
+    ):
+
+        unique_test_seeds = (
+            episodes
+            .groupby(
+                case_keys
+            )[
+                "test_seed"
+            ]
+            .nunique()
+        )
+
+        bad = unique_test_seeds[
+            unique_test_seeds
+            != N_TEST_EPISODES
+        ]
+
+        if not bad.empty:
+
+            print(
+                "\nCases with duplicated or missing test seeds:"
+            )
+
+            print(
+                bad
+            )
+
+            raise RuntimeError(
+                "Held-out test-seed validation failed."
+            )
+
+    # --------------------------------------------------------
+    # Optional validation: one champion per case
+    # --------------------------------------------------------
+
+    if (
+        "champion_agent"
+        in episodes.columns
+    ):
+
+        champion_counts = (
+            episodes
+            .groupby(
+                case_keys
+            )[
+                "champion_agent"
+            ]
+            .nunique()
+        )
+
+        bad = champion_counts[
+            champion_counts
+            != 1
+        ]
+
+        if not bad.empty:
+
+            print(
+                "\nCases containing more than one champion:"
+            )
+
+            print(
+                bad
+            )
+
+            raise RuntimeError(
+                "Champion identity is not unique "
+                "within at least one factorial case."
+            )
+
+    # --------------------------------------------------------
+    # Optional validation: explore=False
+    # --------------------------------------------------------
+
+    if (
+        "explore"
+        in episodes.columns
+    ):
+
+        explore_values = (
+            episodes[
+                "explore"
+            ]
+            .astype(str)
+            .str.lower()
+            .str.strip()
+        )
+
+        valid = explore_values.isin(
+            [
+                "false",
+                "0",
+            ]
+        )
+
+        if not valid.all():
+
+            raise RuntimeError(
+                "At least one held-out episode was "
+                "evaluated with explore=True."
+            )
 
 
-def wilcoxon_against_zero(values: np.ndarray) -> Tuple[float, float, str]:
+# ============================================================
+# Seed-level held-out outcome
+#
+# G_{g,m,e,s}
+# ============================================================
+
+def compute_seed_level_results(
+    episodes,
+):
     """
-    Two-sided Wilcoxon signed-rank test against zero.
-
-    Uses exact calculation when there are no zero differences.
-    If zero differences occur, uses SciPy's approximation because exact
-    enumeration with zero_method='wilcox' is not generally available.
-
-    Returns:
-        statistic, p_value, method_used
+    Compute one held-out mean return per
+    learner/method/environment/training seed.
     """
-    values = np.asarray(values, dtype=float)
-    values = values[np.isfinite(values)]
-
-    if values.size == 0:
-        return np.nan, np.nan, "not_available"
-
-    if np.all(values == 0.0):
-        return 0.0, 1.0, "all_zero"
-
-    has_zero = bool(np.any(values == 0.0))
-
-    method = "approx" if has_zero else "exact"
-
-    result = wilcoxon(
-        values,
-        alternative="two-sided",
-        zero_method="wilcox",
-        correction=False,
-        method=method,
+    seed_level = (
+        episodes
+        .groupby(
+            [
+                "learner",
+                "method",
+                "environment",
+                "training_seed",
+            ],
+            as_index=False,
+        )
+        .agg(
+            n_test_episodes=(
+                "test_return",
+                "size",
+            ),
+            test_mean_return=(
+                "test_return",
+                "mean",
+            ),
+        )
     )
 
-    return (
-        float(result.statistic),
-        float(result.pvalue),
-        method,
-    )
+    return seed_level
 
 
-def bootstrap_median_ci(
-    values: np.ndarray,
-    boot_idx: np.ndarray,
-) -> Tuple[float, float, float]:
+# ============================================================
+# Experimental-design validation
+# ============================================================
+
+def validate_seed_counts(
+    seed_level,
+):
     """
-    Percentile bootstrap CI for the median using paired seed resampling.
+    Require exactly ten training seeds for every expected
+    learner/method/environment factorial cell.
     """
-    values = np.asarray(values, dtype=float)
-
-    medians = np.median(
-        values[boot_idx],
-        axis=1,
+    seed_counts = (
+        seed_level
+        .groupby(
+            [
+                "learner",
+                "method",
+                "environment",
+            ],
+            as_index=False,
+        )
+        .agg(
+            n_training_seeds=(
+                "training_seed",
+                "nunique",
+            )
+        )
     )
 
-    lo, hi = np.quantile(
-        medians,
-        [0.025, 0.975],
+    expected = pd.DataFrame(
+        [
+            (
+                learner,
+                method,
+                environment,
+            )
+            for learner in LEARNERS
+            for method in REQUIRED_METHODS
+            for environment in ENVIRONMENTS
+        ],
+        columns=[
+            "learner",
+            "method",
+            "environment",
+        ],
     )
 
-    return (
-        float(np.median(values)),
-        float(lo),
-        float(hi),
+    checked = expected.merge(
+        seed_counts,
+        on=[
+            "learner",
+            "method",
+            "environment",
+        ],
+        how="left",
+        validate="one_to_one",
     )
 
+    checked[
+        "n_training_seeds"
+    ] = (
+        checked[
+            "n_training_seeds"
+        ]
+        .fillna(
+            0
+        )
+        .astype(
+            int
+        )
+    )
 
-# =============================================================================
-# Matched 2x2 interaction
-# =============================================================================
+    bad = checked[
+        checked[
+            "n_training_seeds"
+        ]
+        != N_TRAINING_SEEDS
+    ]
+
+    if not bad.empty:
+
+        print(
+            "\nIncomplete factorial cells:"
+        )
+
+        print(
+            bad.to_string(
+                index=False
+            )
+        )
+
+        raise RuntimeError(
+            "Expected exactly "
+            f"{N_TRAINING_SEEDS} training seeds "
+            "for every factorial cell."
+        )
+
+    return checked
+
+
+def validate_common_test_seed_sets(
+    episodes,
+    seed_level,
+):
+    """
+    If `test_seed` is available, verify identical held-out test-seed
+    sets across PB2, CODA-I2O, CODA-O2I, and CODA within every
+    learner/environment/training-seed block.
+    """
+    if (
+        "test_seed"
+        not in episodes.columns
+    ):
+        return
+
+    for learner in LEARNERS:
+
+        for environment in ENVIRONMENTS:
+
+            training_seeds = sorted(
+                seed_level[
+                    seed_level[
+                        "learner"
+                    ].eq(
+                        learner
+                    )
+                    &
+                    seed_level[
+                        "environment"
+                    ].eq(
+                        environment
+                    )
+                ][
+                    "training_seed"
+                ]
+                .unique()
+            )
+
+            for training_seed in training_seeds:
+
+                reference = None
+
+                for method in REQUIRED_METHODS:
+
+                    current = set(
+                        episodes[
+                            episodes[
+                                "learner"
+                            ].eq(
+                                learner
+                            )
+                            &
+                            episodes[
+                                "environment"
+                            ].eq(
+                                environment
+                            )
+                            &
+                            episodes[
+                                "training_seed"
+                            ].eq(
+                                training_seed
+                            )
+                            &
+                            episodes[
+                                "method"
+                            ].eq(
+                                method
+                            )
+                        ][
+                            "test_seed"
+                        ]
+                        .astype(
+                            int
+                        )
+                    )
+
+                    if reference is None:
+
+                        reference = current
+
+                    elif current != reference:
+
+                        raise RuntimeError(
+                            "Common held-out test seeds do not match for:\n"
+                            f"{learner}, "
+                            f"{environment}, "
+                            f"training_seed={training_seed}"
+                        )
+
+
+# ============================================================
+# Build matched 2x2 seed-level interaction table
+# ============================================================
 
 def method_table(
-    df: pd.DataFrame,
-    learner: str,
-    environment: str,
-    method: str,
-) -> pd.DataFrame:
+    seed_level,
+    learner,
+    environment,
+    method,
+):
+    """
+    Return one seed-level held-out column for a factorial cell.
+    """
     out = (
-        df[
-            df["learner"].eq(learner)
-            & df["environment"].eq(environment)
-            & df["method"].eq(method)
+        seed_level[
+            seed_level[
+                "learner"
+            ].eq(
+                learner
+            )
+            &
+            seed_level[
+                "environment"
+            ].eq(
+                environment
+            )
+            &
+            seed_level[
+                "method"
+            ].eq(
+                method
+            )
         ][
             [
                 "training_seed",
@@ -336,19 +792,26 @@ def method_table(
         ]
         .rename(
             columns={
-                "test_mean_return": method,
+                "test_mean_return":
+                    method
             }
         )
         .copy()
     )
 
-    duplicates = out["training_seed"].duplicated(
-        keep=False
+    duplicates = (
+        out[
+            "training_seed"
+        ]
+        .duplicated(
+            keep=False
+        )
     )
 
     if duplicates.any():
+
         raise RuntimeError(
-            f"Duplicate seed-level rows for "
+            "Duplicate seed-level rows for "
             f"{learner} / {environment} / {method}:\n"
             f"{out.loc[duplicates].to_string(index=False)}"
         )
@@ -357,17 +820,19 @@ def method_table(
 
 
 def factorial_interaction_table(
-    df: pd.DataFrame,
-    learner: str,
-    environment: str,
-    expected_seeds: int,
-) -> pd.DataFrame:
+    seed_level,
+    learner,
+    environment,
+):
     """
-    Build a matched table with the four 2x2 cells and the interaction contrast.
+    Build the matched 2x2 table and compute the method-level
+    factorial interaction contrast.
+
+    I = CODA - CODA-I2O - CODA-O2I + PB2
     """
     tables = [
         method_table(
-            df,
+            seed_level,
             learner,
             environment,
             method,
@@ -375,9 +840,14 @@ def factorial_interaction_table(
         for method in REQUIRED_METHODS
     ]
 
-    merged = tables[0]
+    merged = tables[
+        0
+    ]
 
-    for table in tables[1:]:
+    for table in tables[
+        1:
+    ]:
+
         merged = merged.merge(
             table,
             on="training_seed",
@@ -387,62 +857,87 @@ def factorial_interaction_table(
 
     merged = (
         merged
-        .sort_values("training_seed")
-        .reset_index(drop=True)
+        .sort_values(
+            "training_seed"
+        )
+        .reset_index(
+            drop=True
+        )
     )
 
-    if len(merged) != expected_seeds:
-        availability = {
-            method: len(
-                method_table(
-                    df,
-                    learner,
-                    environment,
-                    method,
-                )
-            )
-            for method in REQUIRED_METHODS
-        }
+    if (
+        len(
+            merged
+        )
+        != N_TRAINING_SEEDS
+    ):
 
         raise RuntimeError(
             f"{learner} / {environment}: expected "
-            f"{expected_seeds} fully matched seeds, got {len(merged)}.\n"
-            f"Available rows by method: {availability}"
+            f"{N_TRAINING_SEEDS} fully matched seeds, "
+            f"got {len(merged)}."
         )
 
-    # Difference-in-differences:
-    #
-    # (CODA - CODA-O2I) - (CODA-I2O - PB2)
-    #
-    # equivalently:
-    #
-    # CODA - CODA-I2O - CODA-O2I + PB2
-    merged["interaction"] = (
-        merged["CODA"]
-        - merged["CODA-I2O"]
-        - merged["CODA-O2I"]
-        + merged["PB2"]
+    merged[
+        "interaction"
+    ] = (
+        merged[
+            "CODA"
+        ]
+        - merged[
+            "CODA-I2O"
+        ]
+        - merged[
+            "CODA-O2I"
+        ]
+        + merged[
+            "PB2"
+        ]
     )
 
-    # Optional equivalent decompositions for interpretability.
-    merged["I2O_when_O2I_off"] = (
-        merged["CODA-I2O"]
-        - merged["PB2"]
+    # Conditional channel-addition decompositions retained for audit.
+    merged[
+        "I2O_when_O2I_off"
+    ] = (
+        merged[
+            "CODA-I2O"
+        ]
+        - merged[
+            "PB2"
+        ]
     )
 
-    merged["I2O_when_O2I_on"] = (
-        merged["CODA"]
-        - merged["CODA-O2I"]
+    merged[
+        "I2O_when_O2I_on"
+    ] = (
+        merged[
+            "CODA"
+        ]
+        - merged[
+            "CODA-O2I"
+        ]
     )
 
-    merged["O2I_when_I2O_off"] = (
-        merged["CODA-O2I"]
-        - merged["PB2"]
+    merged[
+        "O2I_when_I2O_off"
+    ] = (
+        merged[
+            "CODA-O2I"
+        ]
+        - merged[
+            "PB2"
+        ]
     )
 
-    merged["O2I_when_I2O_on"] = (
-        merged["CODA"]
-        - merged["CODA-I2O"]
+    merged[
+        "O2I_when_I2O_on"
+    ] = (
+        merged[
+            "CODA"
+        ]
+        - merged[
+            "CODA-I2O"
+        ]
     )
 
     merged.insert(
@@ -450,6 +945,7 @@ def factorial_interaction_table(
         "environment",
         environment,
     )
+
     merged.insert(
         0,
         "learner",
@@ -459,97 +955,286 @@ def factorial_interaction_table(
     return merged
 
 
-# =============================================================================
-# Main analysis
-# =============================================================================
+# ============================================================
+# Statistical helpers
+# ============================================================
 
-def run_analysis(
-    ppo_zip: Path,
-    sac_zip: Path,
-    output_dir: Path,
-    expected_seeds: int = EXPECTED_SEEDS,
-    n_boot: int = N_BOOT,
-    bootstrap_seed: int = BOOT_SEED,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    ppo = read_summary(ppo_zip)
-    sac = read_summary(sac_zip)
+def rank_biserial(
+    differences,
+):
+    """
+    Matched-pairs rank-biserial correlation.
 
-    ppo["learner"] = "PPO"
-    sac["learner"] = "SAC"
-
-    df = pd.concat(
-        [ppo, sac],
-        ignore_index=True,
+    Zero differences are excluded, matching
+    zero_method='wilcox'.
+    """
+    d = np.asarray(
+        differences,
+        dtype=float,
     )
 
-    # Check that the required variants exist after normalization.
-    available_methods = sorted(
-        df["method"].dropna().unique().tolist()
-    )
-
-    missing_methods = [
-        method
-        for method in REQUIRED_METHODS
-        if method not in available_methods
+    d = d[
+        np.isfinite(
+            d
+        )
     ]
 
-    if missing_methods:
-        raise RuntimeError(
-            "The held-out summaries do not contain all four required "
-            f"2x2 variants. Missing: {missing_methods}\n"
-            f"Available methods: {available_methods}"
+    d = d[
+        d != 0
+    ]
+
+    if len(
+        d
+    ) == 0:
+
+        return 0.0
+
+    ranks = rankdata(
+        np.abs(
+            d
+        ),
+        method="average",
+    )
+
+    w_plus = float(
+        ranks[
+            d > 0
+        ].sum()
+    )
+
+    w_minus = float(
+        ranks[
+            d < 0
+        ].sum()
+    )
+
+    denominator = (
+        w_plus
+        + w_minus
+    )
+
+    if denominator == 0:
+
+        return 0.0
+
+    return float(
+        (
+            w_plus
+            - w_minus
+        )
+        / denominator
+    )
+
+
+def wilcoxon_against_zero(
+    values,
+):
+    """
+    Two-sided Wilcoxon signed-rank test against zero.
+
+    Exact calculation is used when no zero differences occur.
+    If zeros occur, SciPy's asymptotic implementation is used
+    with zero_method='wilcox'.
+    """
+    values = np.asarray(
+        values,
+        dtype=float,
+    )
+
+    values = values[
+        np.isfinite(
+            values
+        )
+    ]
+
+    if len(
+        values
+    ) == 0:
+
+        return (
+            np.nan,
+            np.nan,
+            "not_available",
         )
 
-    # Same seed-resampling pattern for all eight comparisons.
-    rng = np.random.default_rng(
-        bootstrap_seed
+    if np.all(
+        values
+        == 0
+    ):
+
+        return (
+            0.0,
+            1.0,
+            "all_zero",
+        )
+
+    has_zero = bool(
+        np.any(
+            values
+            == 0
+        )
     )
 
-    boot_idx = rng.integers(
-        0,
-        expected_seeds,
-        size=(n_boot, expected_seeds),
+    method = (
+        "approx"
+        if has_zero
+        else "exact"
     )
 
+    test = wilcoxon(
+        values,
+        alternative="two-sided",
+        zero_method="wilcox",
+        correction=False,
+        method=method,
+    )
+
+    return (
+        float(
+            test.statistic
+        ),
+        float(
+            test.pvalue
+        ),
+        method,
+    )
+
+
+# Same seed-resampling pattern for all eight interaction comparisons.
+rng = np.random.default_rng(
+    BOOT_SEED
+)
+
+boot_idx = rng.integers(
+    low=0,
+    high=N_TRAINING_SEEDS,
+    size=(
+        N_BOOT,
+        N_TRAINING_SEEDS,
+    ),
+)
+
+
+def bootstrap_median_ci(
+    values,
+):
+    """
+    Percentile paired-bootstrap CI for the median seed-level
+    interaction contrast.
+    """
+    values = np.asarray(
+        values,
+        dtype=float,
+    )
+
+    if (
+        len(
+            values
+        )
+        != N_TRAINING_SEEDS
+    ):
+
+        raise ValueError(
+            "Expected exactly "
+            f"{N_TRAINING_SEEDS} matched interaction values."
+        )
+
+    bootstrap_medians = np.median(
+        values[
+            boot_idx
+        ],
+        axis=1,
+    )
+
+    ci_low, ci_high = np.quantile(
+        bootstrap_medians,
+        [
+            0.025,
+            0.975,
+        ],
+    )
+
+    return (
+        float(
+            np.median(
+                values
+            )
+        ),
+        float(
+            ci_low
+        ),
+        float(
+            ci_high
+        ),
+    )
+
+
+# ============================================================
+# Factorial statistical analysis
+# ============================================================
+
+def compute_factorial_analysis(
+    seed_level,
+):
+    """
+    Compute all eight learner-environment factorial interaction
+    contrasts and their exploratory inferential summaries.
+    """
     seed_tables = []
     summary_rows = []
 
-    for learner in LEARNER_ORDER:
-        for environment in ENV_ORDER:
+    for learner in LEARNERS:
+
+        for environment in ENVIRONMENTS:
+
             matched = factorial_interaction_table(
-                df=df,
-                learner=learner,
-                environment=environment,
-                expected_seeds=expected_seeds,
+                seed_level,
+                learner,
+                environment,
             )
 
-            seed_tables.append(matched)
+            seed_tables.append(
+                matched
+            )
 
             interaction = matched[
                 "interaction"
-            ].to_numpy(dtype=float)
+            ].to_numpy(
+                dtype=float
+            )
 
-            median_I, ci_low, ci_high = (
-                bootstrap_median_ci(
-                    interaction,
-                    boot_idx,
+            (
+                median_interaction,
+                ci_low,
+                ci_high,
+            ) = bootstrap_median_ci(
+                interaction
+            )
+
+            n_positive = int(
+                np.sum(
+                    interaction > 0
                 )
             )
 
-            wins = int(
-                np.sum(interaction > 0.0)
-            )
-            ties = int(
-                np.sum(interaction == 0.0)
-            )
-            losses = int(
-                np.sum(interaction < 0.0)
+            n_zero = int(
+                np.sum(
+                    interaction == 0
+                )
             )
 
-            statistic, p_raw, test_method = (
-                wilcoxon_against_zero(
-                    interaction
+            n_negative = int(
+                np.sum(
+                    interaction < 0
                 )
+            )
+
+            (
+                wilcoxon_statistic,
+                p_raw,
+                wilcoxon_method,
+            ) = wilcoxon_against_zero(
+                interaction
             )
 
             r_rb = rank_biserial(
@@ -558,24 +1243,57 @@ def run_analysis(
 
             summary_rows.append(
                 {
-                    "learner": learner,
-                    "environment": environment,
-                    "n_seeds": len(interaction),
-                    "median_interaction": median_I,
-                    "ci_low": ci_low,
-                    "ci_high": ci_high,
-                    "wins": wins,
-                    "ties": ties,
-                    "losses": losses,
-                    "W_T_L": f"{wins}/{ties}/{losses}",
-                    "wilcoxon_statistic": statistic,
-                    "p_raw": p_raw,
-                    "wilcoxon_method": test_method,
-                    "r_rb": r_rb,
+                    "learner":
+                        learner,
+
+                    "environment":
+                        environment,
+
+                    "n_matched_seeds":
+                        len(
+                            interaction
+                        ),
+
+                    "median_interaction":
+                        median_interaction,
+
+                    "bootstrap_95_lo":
+                        ci_low,
+
+                    "bootstrap_95_hi":
+                        ci_high,
+
+                    "n_positive":
+                        n_positive,
+
+                    "n_zero":
+                        n_zero,
+
+                    "n_negative":
+                        n_negative,
+
+                    "P_Z_N":
+                        (
+                            f"{n_positive}/"
+                            f"{n_zero}/"
+                            f"{n_negative}"
+                        ),
+
+                    "wilcoxon_statistic":
+                        wilcoxon_statistic,
+
+                    "wilcoxon_method":
+                        wilcoxon_method,
+
+                    "p_raw":
+                        p_raw,
+
+                    "r_rb":
+                        r_rb,
                 }
             )
 
-    seed_level = pd.concat(
+    seed_level_interaction = pd.concat(
         seed_tables,
         ignore_index=True,
     )
@@ -585,310 +1303,468 @@ def run_analysis(
     )
 
     # Holm correction across the eight exploratory interaction hypotheses.
-    reject, p_holm, _, _ = multipletests(
-        summary["p_raw"].to_numpy(dtype=float),
+    summary[
+        "p_Holm"
+    ] = multipletests(
+        summary[
+            "p_raw"
+        ].to_numpy(
+            dtype=float
+        ),
         alpha=ALPHA,
         method="holm",
+    )[1]
+
+    summary[
+        "significant_Holm"
+    ] = (
+        summary[
+            "p_Holm"
+        ]
+        < ALPHA
     )
 
-    summary["p_holm"] = p_holm
-    summary["significant_holm"] = reject
+    # Preserve manuscript ordering.
+    learner_order = {
+        "PPO": 0,
+        "SAC": 1,
+    }
 
-    # Keep the intended learner/environment ordering.
-    summary["learner"] = pd.Categorical(
-        summary["learner"],
-        categories=LEARNER_ORDER,
-        ordered=True,
+    environment_order = {
+        environment: index
+        for index, environment
+        in enumerate(
+            ENVIRONMENTS
+        )
+    }
+
+    summary[
+        "_learner_order"
+    ] = (
+        summary[
+            "learner"
+        ]
+        .map(
+            learner_order
+        )
     )
 
-    summary["environment"] = pd.Categorical(
-        summary["environment"],
-        categories=ENV_ORDER,
-        ordered=True,
+    summary[
+        "_environment_order"
+    ] = (
+        summary[
+            "environment"
+        ]
+        .map(
+            environment_order
+        )
     )
 
     summary = (
         summary
         .sort_values(
-            ["learner", "environment"]
+            [
+                "_learner_order",
+                "_environment_order",
+            ]
         )
-        .reset_index(drop=True)
+        .drop(
+            columns=[
+                "_learner_order",
+                "_environment_order",
+            ]
+        )
+        .reset_index(
+            drop=True
+        )
     )
 
-    summary["learner"] = (
-        summary["learner"].astype(str)
-    )
-    summary["environment"] = (
-        summary["environment"].astype(str)
-    )
-
-    seed_level["learner"] = pd.Categorical(
-        seed_level["learner"],
-        categories=LEARNER_ORDER,
-        ordered=True,
+    seed_level_interaction[
+        "_learner_order"
+    ] = (
+        seed_level_interaction[
+            "learner"
+        ]
+        .map(
+            learner_order
+        )
     )
 
-    seed_level["environment"] = pd.Categorical(
-        seed_level["environment"],
-        categories=ENV_ORDER,
-        ordered=True,
+    seed_level_interaction[
+        "_environment_order"
+    ] = (
+        seed_level_interaction[
+            "environment"
+        ]
+        .map(
+            environment_order
+        )
     )
 
-    seed_level = (
-        seed_level
+    seed_level_interaction = (
+        seed_level_interaction
         .sort_values(
             [
-                "learner",
-                "environment",
+                "_learner_order",
+                "_environment_order",
                 "training_seed",
             ]
         )
-        .reset_index(drop=True)
+        .drop(
+            columns=[
+                "_learner_order",
+                "_environment_order",
+            ]
+        )
+        .reset_index(
+            drop=True
+        )
     )
 
-    seed_level["learner"] = (
-        seed_level["learner"].astype(str)
-    )
-    seed_level["environment"] = (
-        seed_level["environment"].astype(str)
+    return (
+        seed_level_interaction,
+        summary,
     )
 
-    # -------------------------------------------------------------------------
-    # Save
-    # -------------------------------------------------------------------------
 
-    output_dir = Path(output_dir)
-    output_dir.mkdir(
-        parents=True,
-        exist_ok=True,
+# ============================================================
+# LaTeX formatting
+# ============================================================
+
+def format_interaction(
+    row,
+):
+    """
+    Format median interaction and 95% CI.
+    """
+    return (
+        f"${row['median_interaction']:.2f} "
+        f"[{row['bootstrap_95_lo']:.2f}, "
+        f"{row['bootstrap_95_hi']:.2f}]$"
     )
 
-    seed_level_path = (
-        output_dir
-        / "coda_i2o_o2i_interaction_seed_level.csv"
+
+def format_p(
+    value,
+):
+    return (
+        f"{value:.3f}"
     )
 
-    summary_path = (
-        output_dir
-        / "coda_i2o_o2i_interaction_summary.csv"
+
+def format_rrb(
+    value,
+):
+    return (
+        f"{value:.2f}"
     )
 
-    seed_level.to_csv(
-        seed_level_path,
+
+def build_latex_body(
+    summary,
+):
+    """
+    Build a compact LaTeX table body.
+
+    P/Z/N denotes the number of positive/zero/negative
+    seed-level interaction contrasts.
+    """
+    lines = []
+
+    previous_learner = None
+
+    for _, row in (
+        summary
+        .iterrows()
+    ):
+
+        learner = row[
+            "learner"
+        ]
+
+        if (
+            previous_learner is not None
+            and learner
+            != previous_learner
+        ):
+
+            lines.append(
+                r"\midrule"
+            )
+
+            lines.append(
+                ""
+            )
+
+        latex_row = (
+            f"{learner} & "
+            f"{row['environment']} &\n"
+            f"{format_interaction(row)} &\n"
+            f"{row['P_Z_N']} & "
+            f"{format_p(row['p_raw'])} & "
+            f"{format_p(row['p_Holm'])} & "
+            f"{format_rrb(row['r_rb'])} "
+            r"\\"
+        )
+
+        lines.append(
+            latex_row
+        )
+
+        lines.append(
+            ""
+        )
+
+        previous_learner = (
+            learner
+        )
+
+    return (
+        "\n".join(
+            lines
+        )
+        .rstrip()
+    )
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main():
+
+    # --------------------------------------------------------
+    # Load episode-level held-out data
+    # --------------------------------------------------------
+
+    print(
+        "Loading PPO held-out evaluations..."
+    )
+
+    ppo = load_heldout(
+        PPO_HELDOUT,
+        learner="PPO",
+    )
+
+    print(
+        "Loading SAC held-out evaluations..."
+    )
+
+    sac = load_heldout(
+        SAC_HELDOUT,
+        learner="SAC",
+    )
+
+    episodes = pd.concat(
+        [
+            ppo,
+            sac,
+        ],
+        ignore_index=True,
+    )
+
+    # --------------------------------------------------------
+    # Validate held-out evaluation protocol
+    # --------------------------------------------------------
+
+    validate_episode_level_data(
+        episodes
+    )
+
+    # --------------------------------------------------------
+    # Compute seed-level held-out means
+    # --------------------------------------------------------
+
+    seed_level = (
+        compute_seed_level_results(
+            episodes
+        )
+    )
+
+    seed_counts = (
+        validate_seed_counts(
+            seed_level
+        )
+    )
+
+    validate_common_test_seed_sets(
+        episodes,
+        seed_level,
+    )
+
+    print(
+        "\nTraining seeds per factorial cell:"
+    )
+
+    print(
+        seed_counts.to_string(
+            index=False
+        )
+    )
+
+    # --------------------------------------------------------
+    # Compute factorial interaction
+    # --------------------------------------------------------
+
+    (
+        seed_level_interaction,
+        summary,
+    ) = compute_factorial_analysis(
+        seed_level
+    )
+
+    # --------------------------------------------------------
+    # Save numerical artifacts
+    # --------------------------------------------------------
+
+    seed_level_interaction.to_csv(
+        OUTPUT_SEED_LEVEL,
+        index=False,
+    )
+
+    seed_counts.to_csv(
+        OUTPUT_SEED_COUNTS,
         index=False,
     )
 
     summary.to_csv(
-        summary_path,
+        OUTPUT_SUMMARY,
         index=False,
     )
 
-    # A compact LaTeX-friendly table.
-    latex_df = summary.copy()
+    # --------------------------------------------------------
+    # Generate LaTeX table body
+    # --------------------------------------------------------
 
-    latex_df["interaction_ci"] = latex_df.apply(
-        lambda row: (
-            f"{row['median_interaction']:.2f} "
-            f"[{row['ci_low']:.2f}, {row['ci_high']:.2f}]"
-        ),
-        axis=1,
+    latex_body = build_latex_body(
+        summary
     )
 
-    latex_df["p_holm_fmt"] = latex_df[
-        "p_holm"
-    ].map(
-        lambda x: f"{x:.3f}"
-    )
-
-    latex_df["r_rb_fmt"] = latex_df[
-        "r_rb"
-    ].map(
-        lambda x: f"{x:.2f}"
-    )
-
-    latex_table = latex_df[
-        [
-            "learner",
-            "environment",
-            "interaction_ci",
-            "W_T_L",
-            "p_holm_fmt",
-            "r_rb_fmt",
-        ]
-    ]
-
-    latex_path = (
-        output_dir
-        / "coda_i2o_o2i_interaction_table.tex"
-    )
-
-    with latex_path.open(
-        "w",
+    OUTPUT_LATEX.write_text(
+        latex_body
+        + "\n",
         encoding="utf-8",
-    ) as f:
-        f.write(
-            latex_table.to_latex(
-                index=False,
-                escape=False,
-                column_format="llcccc",
-                header=[
-                    "Learner",
-                    "Environment",
-                    r"$I$ [95\% CI]",
-                    "W/T/L",
-                    r"$p_{\mathrm{Holm}}$",
-                    r"$r_{\mathrm{rb}}$",
-                ],
-            )
-        )
-
-    return seed_level, summary
-
-
-# =============================================================================
-# CLI
-# =============================================================================
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Compute the exploratory I2O x O2I factorial interaction "
-            "contrast from CODA held-out seed-level results."
-        )
     )
 
-    parser.add_argument(
-        "--ppo",
-        type=Path,
-        default=Path(
-            "../results/ppo/heldout_reward_ppo_final/heldout_test_seed_summary.zip"
-        ),
-        help=(
-            "PPO held-out ZIP containing "
-            "heldout_test_seed_summary.csv"
-        ),
-    )
+    # --------------------------------------------------------
+    # Console report
+    # --------------------------------------------------------
 
-    parser.add_argument(
-        "--sac",
-        type=Path,
-        default=Path(
-            "../results/sac/heldout_reward_sac_final/heldout_test_seed_summary.zip"
-        ),
-        help=(
-            "SAC held-out ZIP containing "
-            "heldout_test_seed_summary.csv"
-        ),
-    )
-
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=Path(
-            "results/statistics/factorial_interaction"
-        ),
-        help="Output directory.",
-    )
-
-    parser.add_argument(
-        "--expected-seeds",
-        type=int,
-        default=EXPECTED_SEEDS,
-        help="Expected number of matched training seeds per setting.",
-    )
-
-    parser.add_argument(
-        "--bootstrap-resamples",
-        type=int,
-        default=N_BOOT,
-        help="Number of bootstrap resamples.",
-    )
-
-    parser.add_argument(
-        "--bootstrap-seed",
-        type=int,
-        default=BOOT_SEED,
-        help="Bootstrap RNG seed.",
-    )
-
-    return parser.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-
-    seed_level, summary = run_analysis(
-        ppo_zip=args.ppo,
-        sac_zip=args.sac,
-        output_dir=args.output_dir,
-        expected_seeds=args.expected_seeds,
-        n_boot=args.bootstrap_resamples,
-        bootstrap_seed=args.bootstrap_seed,
-    )
-
-    pd.set_option(
-        "display.max_columns",
-        None,
-    )
-    pd.set_option(
-        "display.width",
-        180,
+    print(
+        "\n"
+        + "=" * 100
     )
 
     print(
-        "\nCODA I2O x O2I factorial interaction analysis"
+        "CODA I2O x O2I FACTORIAL INTERACTION"
     )
-    print("=" * 78)
 
-    display_cols = [
+    print(
+        "=" * 100
+    )
+
+    display_columns = [
         "learner",
         "environment",
+        "n_matched_seeds",
         "median_interaction",
-        "ci_low",
-        "ci_high",
-        "W_T_L",
+        "bootstrap_95_lo",
+        "bootstrap_95_hi",
+        "P_Z_N",
         "p_raw",
-        "p_holm",
+        "p_Holm",
         "r_rb",
-        "significant_holm",
+        "significant_Holm",
     ]
 
     print(
-        summary[display_cols].to_string(
-            index=False,
-            float_format=lambda x: f"{x:.4f}",
+        summary[
+            display_columns
+        ]
+        .round(
+            6
+        )
+        .to_string(
+            index=False
         )
     )
 
-    print("\nInterpretation:")
     print(
-        "  interaction > 0 : positive/super-additive interaction "
-        "on held-out-return scale"
-    )
-    print(
-        "  interaction < 0 : sub-additive interaction "
-        "on held-out-return scale"
-    )
-    print(
-        "  p_holm < 0.05    : significant after Holm correction "
-        "across the 8 exploratory interaction tests"
+        "\nSciPy version:",
+        scipy.__version__,
     )
 
     print(
-        f"\nSeed-level output: "
-        f"{args.output_dir / 'coda_i2o_o2i_interaction_seed_level.csv'}"
+        "Bootstrap: "
+        f"N={N_BOOT}, percentile 95% CI, seed={BOOT_SEED}"
     )
 
     print(
-        f"Summary output:    "
-        f"{args.output_dir / 'coda_i2o_o2i_interaction_summary.csv'}"
+        "Wilcoxon: two-sided, zero_method='wilcox', "
+        "correction=False; exact when no zero interaction "
+        "contrasts are present, approx otherwise"
     )
 
     print(
-        f"LaTeX table:       "
-        f"{args.output_dir / 'coda_i2o_o2i_interaction_table.tex'}"
+        "Holm family: 8 exploratory "
+        "learner-environment interaction hypotheses"
     )
 
+    print(
+        "P/Z/N: positive / zero / negative "
+        "seed-level interaction contrasts"
+    )
+
+    print(
+        "\n"
+        + "=" * 100
+    )
+
+    print(
+        "LATEX TABLE BODY"
+    )
+
+    print(
+        "=" * 100
+        + "\n"
+    )
+
+    print(
+        latex_body
+    )
+
+    # --------------------------------------------------------
+    # Report generated files
+    # --------------------------------------------------------
+
+    print(
+        "\nGenerated outputs:"
+    )
+
+    print(
+        f"  Seed-level interaction : {OUTPUT_SEED_LEVEL}"
+    )
+
+    print(
+        f"  Seed counts            : {OUTPUT_SEED_COUNTS}"
+    )
+
+    print(
+        f"  Summary                : {OUTPUT_SUMMARY}"
+    )
+
+    print(
+        f"  LaTeX table body       : {OUTPUT_LATEX}"
+    )
+
+    print(
+        "\nDone."
+    )
+
+
+# ============================================================
+# Entry point
+# ============================================================
 
 if __name__ == "__main__":
     main()
