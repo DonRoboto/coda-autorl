@@ -1,29 +1,125 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Created on Fri Sep 25 21:02:45 2026
 
-@author: yor5
+"""
+Table 5: Primary paired held-out CODA vs PB2 analysis.
+
+For each learner (PPO/SAC) and environment, this script:
+
+1. Reads episode-level held-out evaluation results.
+2. Validates the held-out evaluation protocol.
+3. Computes one held-out mean return per training seed.
+4. Forms matched CODA - PB2 seed-level differences.
+5. Reports:
+   - median paired difference,
+   - percentile 95% paired-bootstrap confidence interval,
+   - win/tie/loss counts,
+   - exact two-sided Wilcoxon signed-rank test,
+   - Holm-adjusted p-value across the eight primary comparisons,
+   - matched-pairs rank-biserial correlation.
+6. Saves all intermediate and final numerical artifacts.
+7. Generates the LaTeX table body used for the manuscript.
+
+Expected repository layout
+--------------------------
+
+coda-autorl/
+├── analysis/
+│   └── Tab05_paired_held-out.py
+└── results/
+    ├── ppo/
+    │   └── heldout_reward_ppo_final/
+    │       └── heldout_test_episodes.csv
+    └── sac/
+        └── heldout_reward_sac_final/
+            └── heldout_test_episodes.csv
+
+Outputs
+-------
+
+results/analysis/primary_paired_heldout/
+├── primary_seed_level_heldout.csv
+├── primary_coda_pb2_paired_differences.csv
+├── primary_coda_pb2_stats.csv
+└── primary_paired_table_body.tex
 """
 
-import zipfile
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import scipy
-from scipy.stats import wilcoxon, rankdata
+from scipy.stats import rankdata, wilcoxon
 from statsmodels.stats.multitest import multipletests
 
 
 # ============================================================
-# Configuration
+# Paths
 # ============================================================
 
+# Works when this file is stored under:
+#     <repo_root>/analysis/Tab05_paired_held-out.py
+#
+# The fallback also allows execution from an interactive session.
+if "__file__" in globals():
+    SCRIPT_DIR = Path(__file__).resolve().parent
+else:
+    SCRIPT_DIR = Path.cwd()
 
-PPO_HELDOUT = Path("../results/ppo/heldout_reward_ppo_final/heldout_test_episodes.csv")
-SAC_HELDOUT = Path("../results/sac/heldout_reward_sac_final/heldout_test_episodes.csv")
+REPO_ROOT = SCRIPT_DIR.parent
 
+PPO_HELDOUT = (
+    REPO_ROOT
+    / "results"
+    / "ppo"
+    / "heldout_reward_ppo_final"
+    / "heldout_test_episodes.csv"
+)
+
+SAC_HELDOUT = (
+    REPO_ROOT
+    / "results"
+    / "sac"
+    / "heldout_reward_sac_final"
+    / "heldout_test_episodes.csv"
+)
+
+OUTPUT_DIR = (
+    REPO_ROOT
+    / "results"
+    / "analysis"
+    / "primary_paired_heldout"
+)
+
+OUTPUT_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+OUTPUT_SEED_LEVEL = (
+    OUTPUT_DIR
+    / "primary_seed_level_heldout.csv"
+)
+
+OUTPUT_PAIRED = (
+    OUTPUT_DIR
+    / "primary_coda_pb2_paired_differences.csv"
+)
+
+OUTPUT_STATS = (
+    OUTPUT_DIR
+    / "primary_coda_pb2_stats.csv"
+)
+
+OUTPUT_LATEX = (
+    OUTPUT_DIR
+    / "primary_paired_table_body.tex"
+)
+
+
+# ============================================================
+# Analysis configuration
+# ============================================================
 
 N_TEST_EPISODES = 100
 N_TRAINING_SEEDS = 10
@@ -43,23 +139,32 @@ LEARNERS = [
     "SAC",
 ]
 
-OUTPUT_SEED_LEVEL = "primary_seed_level_heldout.csv"
-OUTPUT_PAIRED = "primary_coda_pb2_paired_differences.csv"
-OUTPUT_STATS = "primary_coda_pb2_stats.csv"
-OUTPUT_LATEX = "primary_paired_table_body.tex"
-
 
 # ============================================================
-# Load original episode-level data from ZIP
+# Input loading
 # ============================================================
 
-def read_episode_file(path, learner):
+def read_episode_file(
+    path,
+    learner,
+):
+    """
+    Read one episode-level held-out evaluation file and attach
+    its learner label.
+    """
+    path = Path(
+        path
+    )
+
     if not path.exists():
         raise FileNotFoundError(
-            f"Held-out file not found: {path}"
+            "Held-out evaluation file not found:\n"
+            f"{path}"
         )
 
-    df = pd.read_csv(path)
+    df = pd.read_csv(
+        path
+    )
 
     required = {
         "method",
@@ -68,7 +173,10 @@ def read_episode_file(path, learner):
         "test_return",
     }
 
-    missing = required - set(df.columns)
+    missing = (
+        required
+        - set(df.columns)
+    )
 
     if missing:
         raise ValueError(
@@ -81,266 +189,329 @@ def read_episode_file(path, learner):
 
     return df
 
-ppo = read_episode_file(
-    PPO_HELDOUT,
-    "PPO"
-)
-
-sac = read_episode_file(
-    SAC_HELDOUT,
-    "SAC"
-)
-
-episodes = pd.concat(
-    [ppo, sac],
-    ignore_index=True
-)
-
 
 # ============================================================
-# Validate original data
+# Data validation
 # ============================================================
 
-required_columns = {
-    "method",
-    "environment",
-    "training_seed",
-    "test_return",
-}
+def validate_episode_level_data(
+    episodes,
+):
+    """
+    Validate the episode-level held-out evaluation protocol.
+    """
+    required_columns = {
+        "learner",
+        "method",
+        "environment",
+        "training_seed",
+        "test_return",
+    }
 
-missing = required_columns - set(episodes.columns)
-
-if missing:
-    raise ValueError(
-        f"Missing required columns: {sorted(missing)}"
+    missing = (
+        required_columns
+        - set(episodes.columns)
     )
 
-
-episodes["training_seed"] = pd.to_numeric(
-    episodes["training_seed"],
-    errors="raise"
-).astype(int)
-
-episodes["test_return"] = pd.to_numeric(
-    episodes["test_return"],
-    errors="raise"
-)
-
-if not np.isfinite(
-    episodes["test_return"]
-).all():
-    raise ValueError(
-        "Non-finite held-out returns detected."
-    )
-
-
-# ============================================================
-# Keep only primary methods
-# ============================================================
-
-episodes = episodes[
-    episodes["method"].isin(
-        ["CODA", "PB2"]
-    )
-].copy()
-
-
-# ============================================================
-# Validate 100 episodes per training seed
-# ============================================================
-
-case_keys = [
-    "learner",
-    "method",
-    "environment",
-    "training_seed",
-]
-
-case_counts = (
-    episodes
-    .groupby(case_keys)
-    .size()
-)
-
-bad_counts = case_counts[
-    case_counts != N_TEST_EPISODES
-]
-
-if not bad_counts.empty:
-    print(
-        "\nCases with incorrect number of "
-        "held-out episodes:"
-    )
-    print(bad_counts)
-
-    raise ValueError(
-        "Expected exactly "
-        f"{N_TEST_EPISODES} held-out episodes "
-        "per training seed."
-    )
-
-
-# ============================================================
-# Optional validation: common test seeds
-# ============================================================
-
-if "test_seed" in episodes.columns:
-
-    test_seed_counts = (
-        episodes
-        .groupby(case_keys)["test_seed"]
-        .nunique()
-    )
-
-    if not (
-        test_seed_counts == N_TEST_EPISODES
-    ).all():
+    if missing:
         raise ValueError(
-            "At least one case does not contain "
-            f"{N_TEST_EPISODES} unique test seeds."
+            "Missing required columns: "
+            f"{sorted(missing)}"
         )
 
+    episodes = episodes.copy()
 
-# ============================================================
-# Optional validation: one champion per case
-# ============================================================
+    episodes[
+        "training_seed"
+    ] = pd.to_numeric(
+        episodes[
+            "training_seed"
+        ],
+        errors="raise",
+    ).astype(int)
 
-if "champion_agent" in episodes.columns:
+    episodes[
+        "test_return"
+    ] = pd.to_numeric(
+        episodes[
+            "test_return"
+        ],
+        errors="raise",
+    )
 
-    champion_counts = (
-        episodes
-        .groupby(case_keys)[
-            "champion_agent"
+    if not np.isfinite(
+        episodes[
+            "test_return"
         ]
-        .nunique()
-    )
-
-    if not (
-        champion_counts == 1
     ).all():
+
         raise ValueError(
-            "More than one champion appears in "
-            "at least one held-out case."
+            "Non-finite held-out returns detected."
         )
 
+    # Primary comparison uses CODA and PB2 only.
+    episodes = episodes[
+        episodes[
+            "method"
+        ].isin(
+            ["CODA", "PB2"]
+        )
+    ].copy()
 
-# ============================================================
-# Optional validation: explore=False
-# ============================================================
+    case_keys = [
+        "learner",
+        "method",
+        "environment",
+        "training_seed",
+    ]
 
-if "explore" in episodes.columns:
+    # --------------------------------------------------------
+    # Validate held-out episode count
+    # --------------------------------------------------------
 
-    explore_values = (
-        episodes["explore"]
-        .astype(str)
-        .str.lower()
-        .str.strip()
+    case_counts = (
+        episodes
+        .groupby(
+            case_keys
+        )
+        .size()
     )
 
-    if not explore_values.isin(
-        ["false", "0"]
-    ).all():
-        raise ValueError(
-            "At least one held-out episode "
-            "was evaluated with explore=True."
+    bad_counts = case_counts[
+        case_counts
+        != N_TEST_EPISODES
+    ]
+
+    if not bad_counts.empty:
+
+        print(
+            "\nCases with incorrect number of "
+            "held-out episodes:"
         )
+
+        print(
+            bad_counts
+        )
+
+        raise ValueError(
+            "Expected exactly "
+            f"{N_TEST_EPISODES} held-out episodes "
+            "per training seed."
+        )
+
+    # --------------------------------------------------------
+    # Optional validation: common test seeds
+    # --------------------------------------------------------
+
+    if (
+        "test_seed"
+        in episodes.columns
+    ):
+
+        test_seed_counts = (
+            episodes
+            .groupby(
+                case_keys
+            )[
+                "test_seed"
+            ]
+            .nunique()
+        )
+
+        if not (
+            test_seed_counts
+            == N_TEST_EPISODES
+        ).all():
+
+            raise ValueError(
+                "At least one case does not contain "
+                f"{N_TEST_EPISODES} unique test seeds."
+            )
+
+    # --------------------------------------------------------
+    # Optional validation: one champion per case
+    # --------------------------------------------------------
+
+    if (
+        "champion_agent"
+        in episodes.columns
+    ):
+
+        champion_counts = (
+            episodes
+            .groupby(
+                case_keys
+            )[
+                "champion_agent"
+            ]
+            .nunique()
+        )
+
+        if not (
+            champion_counts
+            == 1
+        ).all():
+
+            raise ValueError(
+                "More than one champion appears in "
+                "at least one held-out case."
+            )
+
+    # --------------------------------------------------------
+    # Optional validation: explore=False
+    # --------------------------------------------------------
+
+    if (
+        "explore"
+        in episodes.columns
+    ):
+
+        explore_values = (
+            episodes[
+                "explore"
+            ]
+            .astype(str)
+            .str.lower()
+            .str.strip()
+        )
+
+        if not explore_values.isin(
+            [
+                "false",
+                "0",
+            ]
+        ).all():
+
+            raise ValueError(
+                "At least one held-out episode "
+                "was evaluated with explore=True."
+            )
+
+    return episodes
 
 
 # ============================================================
-# Step 1:
-# Compute seed-level held-out mean
+# Seed-level held-out outcome
 #
 # G_{g,m,e,s}
 # ============================================================
 
-seed_level = (
-    episodes
-    .groupby(
-        [
-            "learner",
-            "method",
-            "environment",
-            "training_seed",
-        ],
-        as_index=False
+def compute_seed_level_results(
+    episodes,
+):
+    """
+    Compute one held-out mean return per
+    learner/method/environment/training seed.
+    """
+    seed_level = (
+        episodes
+        .groupby(
+            [
+                "learner",
+                "method",
+                "environment",
+                "training_seed",
+            ],
+            as_index=False,
+        )
+        .agg(
+            n_test_episodes=(
+                "test_return",
+                "size",
+            ),
+            test_mean_return=(
+                "test_return",
+                "mean",
+            ),
+        )
     )
-    .agg(
-        n_test_episodes=(
-            "test_return",
-            "size"
-        ),
-        test_mean_return=(
-            "test_return",
-            "mean"
-        ),
+
+    return seed_level
+
+
+def validate_training_seed_counts(
+    seed_level,
+):
+    """
+    Validate the expected number of independent training seeds.
+    """
+    seed_counts = (
+        seed_level
+        .groupby(
+            [
+                "learner",
+                "method",
+                "environment",
+            ],
+            as_index=False,
+        )
+        .agg(
+            n_training_seeds=(
+                "training_seed",
+                "nunique",
+            )
+        )
     )
-)
-
-
-# ============================================================
-# Validate 10 training seeds per method/cell
-# ============================================================
-
-seed_counts = (
-    seed_level
-    .groupby(
-        [
-            "learner",
-            "method",
-            "environment",
-        ]
-    )["training_seed"]
-    .nunique()
-)
-
-print(
-    "\nTraining seeds per cell:\n"
-)
-
-print(seed_counts)
-
-if not (
-    seed_counts == N_TRAINING_SEEDS
-).all():
 
     bad = seed_counts[
-        seed_counts != N_TRAINING_SEEDS
+        seed_counts[
+            "n_training_seeds"
+        ]
+        != N_TRAINING_SEEDS
     ]
 
-    print(
-        "\nIncomplete cells:"
-    )
-    print(bad)
+    if not bad.empty:
 
-    raise ValueError(
-        "Expected exactly "
-        f"{N_TRAINING_SEEDS} training seeds "
-        "for every CODA/PB2 cell."
-    )
+        print(
+            "\nIncomplete cells:"
+        )
 
+        print(
+            bad.to_string(
+                index=False
+            )
+        )
 
-seed_level.to_csv(
-    OUTPUT_SEED_LEVEL,
-    index=False
-)
+        raise ValueError(
+            "Expected exactly "
+            f"{N_TRAINING_SEEDS} training seeds "
+            "for every CODA/PB2 cell."
+        )
+
+    return seed_counts
 
 
 # ============================================================
-# Build matched CODA-PB2 seed differences
+# Matched CODA-PB2 seed differences
 # ============================================================
 
 def paired_seed_data(
+    seed_level,
     learner,
-    environment
+    environment,
 ):
-
+    """
+    Build matched seed-level CODA and PB2 held-out outcomes.
+    """
     coda = (
         seed_level[
-            (seed_level["learner"] == learner)
+            seed_level[
+                "learner"
+            ].eq(
+                learner
+            )
             &
-            (seed_level["environment"] == environment)
+            seed_level[
+                "environment"
+            ].eq(
+                environment
+            )
             &
-            (seed_level["method"] == "CODA")
+            seed_level[
+                "method"
+            ].eq(
+                "CODA"
+            )
         ][
             [
                 "training_seed",
@@ -357,11 +528,23 @@ def paired_seed_data(
 
     pb2 = (
         seed_level[
-            (seed_level["learner"] == learner)
+            seed_level[
+                "learner"
+            ].eq(
+                learner
+            )
             &
-            (seed_level["environment"] == environment)
+            seed_level[
+                "environment"
+            ].eq(
+                environment
+            )
             &
-            (seed_level["method"] == "PB2")
+            seed_level[
+                "method"
+            ].eq(
+                "PB2"
+            )
         ][
             [
                 "training_seed",
@@ -382,28 +565,49 @@ def paired_seed_data(
             pb2,
             on="training_seed",
             how="inner",
-            validate="one_to_one"
+            validate="one_to_one",
         )
         .sort_values(
             "training_seed"
         )
-        .reset_index(drop=True)
+        .reset_index(
+            drop=True
+        )
     )
 
-    if len(paired) != N_TRAINING_SEEDS:
+    if (
+        len(paired)
+        != N_TRAINING_SEEDS
+    ):
+
         raise RuntimeError(
             f"{learner}, {environment}: "
             f"expected {N_TRAINING_SEEDS} "
             f"matched seeds, got {len(paired)}"
         )
 
-    paired["difference"] = (
-        paired["CODA"]
-        - paired["PB2"]
+    paired[
+        "difference"
+    ] = (
+        paired[
+            "CODA"
+        ]
+        - paired[
+            "PB2"
+        ]
     )
 
-    paired["learner"] = learner
-    paired["environment"] = environment
+    paired.insert(
+        0,
+        "environment",
+        environment,
+    )
+
+    paired.insert(
+        0,
+        "learner",
+        learner,
+    )
 
     return paired[
         [
@@ -417,51 +621,38 @@ def paired_seed_data(
     ]
 
 
-paired_frames = []
-
-for learner in LEARNERS:
-    for environment in ENVIRONMENTS:
-
-        paired_frames.append(
-            paired_seed_data(
-                learner,
-                environment
-            )
-        )
-
-paired_all = pd.concat(
-    paired_frames,
-    ignore_index=True
-)
-
-paired_all.to_csv(
-    OUTPUT_PAIRED,
-    index=False
-)
-
-
 # ============================================================
 # Matched-pairs rank-biserial correlation
 # ============================================================
 
 def rank_biserial(
-    differences
+    differences,
 ):
+    """
+    Matched-pairs rank-biserial correlation.
+
+    Zero differences are excluded, matching
+    zero_method='wilcox'.
+    """
     d = np.asarray(
         differences,
-        dtype=float
+        dtype=float,
     )
 
-    # Wilcoxon "wilcox" convention:
-    # zero differences are excluded
-    d = d[d != 0]
+    d = d[
+        np.isfinite(d)
+    ]
+
+    d = d[
+        d != 0
+    ]
 
     if len(d) == 0:
         return np.nan
 
     ranks = rankdata(
         np.abs(d),
-        method="average"
+        method="average",
     )
 
     w_plus = ranks[
@@ -472,19 +663,28 @@ def rank_biserial(
         d < 0
     ].sum()
 
+    denominator = (
+        w_plus
+        + w_minus
+    )
+
+    if denominator == 0:
+        return np.nan
+
     return float(
-        (w_plus - w_minus)
-        /
-        (w_plus + w_minus)
+        (
+            w_plus
+            - w_minus
+        )
+        / denominator
     )
 
 
 # ============================================================
 # Bootstrap setup
 #
-# Important:
-# This reproduces the seed-resampling pattern used in
-# the original recomputation script.
+# This preserves the resampling specification used in the
+# current primary analysis.
 # ============================================================
 
 rng = np.random.default_rng(
@@ -496,28 +696,38 @@ boot_idx = rng.integers(
     high=N_TRAINING_SEEDS,
     size=(
         N_BOOT,
-        N_TRAINING_SEEDS
-    )
+        N_TRAINING_SEEDS,
+    ),
 )
 
 
 def bootstrap_median_ci(
-    differences
+    differences,
 ):
+    """
+    Percentile paired-bootstrap CI for the median
+    CODA - PB2 matched-seed difference.
+    """
     d = np.asarray(
         differences,
-        dtype=float
+        dtype=float,
     )
 
-    if len(d) != N_TRAINING_SEEDS:
+    if (
+        len(d)
+        != N_TRAINING_SEEDS
+    ):
+
         raise ValueError(
             "Bootstrap function expects "
             f"{N_TRAINING_SEEDS} paired seeds."
         )
 
     boot_medians = np.median(
-        d[boot_idx],
-        axis=1
+        d[
+            boot_idx
+        ],
+        axis=1,
     )
 
     lo, hi = np.quantile(
@@ -525,12 +735,14 @@ def bootstrap_median_ci(
         [
             0.025,
             0.975,
-        ]
+        ],
     )
 
     return (
         float(
-            np.median(d)
+            np.median(
+                d
+            )
         ),
         float(lo),
         float(hi),
@@ -538,197 +750,167 @@ def bootstrap_median_ci(
 
 
 # ============================================================
-# Compute eight primary comparisons
+# Primary statistical analysis
 # ============================================================
 
-rows = []
+def compute_primary_stats(
+    paired_all,
+):
+    """
+    Compute the eight primary CODA-vs-PB2 comparisons.
+    """
+    rows = []
 
-for learner in LEARNERS:
+    for learner in LEARNERS:
 
-    for environment in ENVIRONMENTS:
+        for environment in ENVIRONMENTS:
 
-        paired = paired_all[
-            (paired_all["learner"] == learner)
-            &
-            (
-                paired_all["environment"]
-                == environment
-            )
-        ].copy()
+            paired = paired_all[
+                paired_all[
+                    "learner"
+                ].eq(
+                    learner
+                )
+                &
+                paired_all[
+                    "environment"
+                ].eq(
+                    environment
+                )
+            ].copy()
 
-        d = paired[
-            "difference"
-        ].to_numpy(
-            dtype=float
-        )
-
-        # ----------------------------------------------------
-        # W/T/L
-        # ----------------------------------------------------
-
-        wins = int(
-            np.sum(d > 0)
-        )
-
-        ties = int(
-            np.sum(d == 0)
-        )
-
-        losses = int(
-            np.sum(d < 0)
-        )
-
-        # Primary table currently contains no zero differences.
-        # Exact Wilcoxon is therefore well-defined.
-        if ties > 0:
-            raise RuntimeError(
-                f"{learner}, {environment}: "
-                "zero paired difference detected. "
-                "The original primary analysis used "
-                "exact Wilcoxon with zero_method='wilcox'; "
-                "inspect this case before continuing."
+            d = paired[
+                "difference"
+            ].to_numpy(
+                dtype=float
             )
 
-        # ----------------------------------------------------
-        # Median + paired bootstrap CI
-        # ----------------------------------------------------
+            wins = int(
+                np.sum(
+                    d > 0
+                )
+            )
 
-        median_diff, ci_low, ci_high = (
-            bootstrap_median_ci(d)
-        )
+            ties = int(
+                np.sum(
+                    d == 0
+                )
+            )
 
-        # ----------------------------------------------------
-        # Wilcoxon signed-rank
-        # ----------------------------------------------------
+            losses = int(
+                np.sum(
+                    d < 0
+                )
+            )
 
-        test = wilcoxon(
-            d,
-            alternative="two-sided",
-            zero_method="wilcox",
-            correction=False,
-            method="exact",
-        )
+            # The current primary family contains no zero differences.
+            # Exact Wilcoxon is therefore well-defined.
+            if ties > 0:
 
-        # ----------------------------------------------------
-        # Rank-biserial
-        # ----------------------------------------------------
+                raise RuntimeError(
+                    f"{learner}, {environment}: "
+                    "zero paired difference detected. "
+                    "The current primary analysis uses "
+                    "exact Wilcoxon with zero_method='wilcox'; "
+                    "inspect this case before continuing."
+                )
 
-        r_rb = rank_biserial(
-            d
-        )
+            median_diff, ci_low, ci_high = (
+                bootstrap_median_ci(
+                    d
+                )
+            )
 
-        rows.append(
-            {
-                "learner":
-                    learner,
+            test = wilcoxon(
+                d,
+                alternative="two-sided",
+                zero_method="wilcox",
+                correction=False,
+                method="exact",
+            )
 
-                "environment":
-                    environment,
+            r_rb = (
+                rank_biserial(
+                    d
+                )
+            )
 
-                "median_difference":
-                    median_diff,
+            rows.append(
+                {
+                    "learner":
+                        learner,
 
-                "bootstrap_95_lo":
-                    ci_low,
+                    "environment":
+                        environment,
 
-                "bootstrap_95_hi":
-                    ci_high,
+                    "n_matched_seeds":
+                        len(d),
 
-                "wins":
-                    wins,
+                    "median_difference":
+                        median_diff,
 
-                "ties":
-                    ties,
+                    "bootstrap_95_lo":
+                        ci_low,
 
-                "losses":
-                    losses,
+                    "bootstrap_95_hi":
+                        ci_high,
 
-                "W":
-                    float(
-                        test.statistic
-                    ),
+                    "wins":
+                        wins,
 
-                "p_raw":
-                    float(
-                        test.pvalue
-                    ),
+                    "ties":
+                        ties,
 
-                "r_rb":
-                    r_rb,
-            }
-        )
+                    "losses":
+                        losses,
 
+                    "W_T_L":
+                        (
+                            f"{wins}/"
+                            f"{ties}/"
+                            f"{losses}"
+                        ),
 
-stats = pd.DataFrame(
-    rows
-)
+                    "W":
+                        float(
+                            test.statistic
+                        ),
 
+                    "p_raw":
+                        float(
+                            test.pvalue
+                        ),
 
-# ============================================================
-# Holm correction across ALL 8 primary hypotheses
-# ============================================================
+                    "r_rb":
+                        r_rb,
+                }
+            )
 
-stats["p_Holm"] = multipletests(
-    stats["p_raw"],
-    alpha=0.05,
-    method="holm"
-)[1]
-
-
-# ============================================================
-# Save numerical audit table
-# ============================================================
-
-stats.to_csv(
-    OUTPUT_STATS,
-    index=False
-)
-
-
-# ============================================================
-# Print full-precision audit output
-# ============================================================
-
-print(
-    "\n"
-    + "=" * 80
-)
-
-print(
-    "PRIMARY CODA vs PB2"
-)
-
-print(
-    "=" * 80
-)
-
-print(
-    stats.to_string(
-        index=False
+    stats = pd.DataFrame(
+        rows
     )
-)
 
-print(
-    "\nSciPy version:",
-    scipy.__version__
-)
+    # Holm correction across all 8 primary hypotheses.
+    stats[
+        "p_Holm"
+    ] = multipletests(
+        stats[
+            "p_raw"
+        ],
+        alpha=0.05,
+        method="holm",
+    )[1]
 
-print(
-    "Wilcoxon: exact, two-sided, "
-    "zero_method='wilcox', "
-    "correction=False"
-)
+    stats[
+        "significant_Holm"
+    ] = (
+        stats[
+            "p_Holm"
+        ]
+        < 0.05
+    )
 
-print(
-    f"Bootstrap: N={N_BOOT}, "
-    f"percentile 95% CI, "
-    f"seed={BOOT_SEED}"
-)
-
-print(
-    "Holm family: 8 primary "
-    "learner-environment comparisons"
-)
+    return stats
 
 
 # ============================================================
@@ -736,7 +918,7 @@ print(
 # ============================================================
 
 def format_effect(
-    row
+    row,
 ):
     return (
         f"${row['median_difference']:.2f} "
@@ -746,146 +928,358 @@ def format_effect(
 
 
 def format_wtl(
-    row
+    row,
 ):
-    return (
-        f"{int(row['wins'])}/"
-        f"{int(row['ties'])}/"
-        f"{int(row['losses'])}"
+    return str(
+        row[
+            "W_T_L"
+        ]
     )
 
 
 def format_p(
-    p
+    p,
 ):
-    return f"{p:.3f}"
+    return (
+        f"{p:.3f}"
+    )
 
 
 def format_holm(
-    p
+    p,
 ):
-    text = f"{p:.3f}"
+    text_value = (
+        f"{p:.3f}"
+    )
 
-    if p < 0.05:
+    if (
+        p < 0.05
+    ):
+
         return (
-            rf"\textbf{{{text}}}"
+            rf"\textbf{{{text_value}}}"
         )
 
-    return text
+    return text_value
 
 
 def format_rrb(
-    r
+    r,
 ):
-    return f"{r:.2f}"
+    return (
+        f"{r:.2f}"
+    )
 
 
-# ============================================================
-# Generate LaTeX TABLE BODY
-# ============================================================
-
-lines = []
-
-for learner_idx, learner in enumerate(
-    LEARNERS
+def build_latex_body(
+    stats,
 ):
+    """
+    Build the body of manuscript Table 5.
+    """
+    lines = []
 
-    if learner_idx > 0:
-        lines.append(
-            r"\midrule"
-        )
-        lines.append("")
+    for learner_idx, learner in enumerate(
+        LEARNERS
+    ):
 
-    learner_rows = stats[
-        stats["learner"] == learner
-    ]
+        if learner_idx > 0:
 
-    for environment in ENVIRONMENTS:
-
-        row = learner_rows[
-            learner_rows[
-                "environment"
-            ] == environment
-        ]
-
-        if len(row) != 1:
-            raise RuntimeError(
-                f"Expected exactly one row for "
-                f"{learner}, {environment}"
+            lines.append(
+                r"\midrule"
             )
 
-        row = row.iloc[0]
+            lines.append(
+                ""
+            )
 
-        latex_row = (
-            f"{learner} & "
-            f"{environment} &\n"
-            f"{format_effect(row)} &\n"
-            f"{format_wtl(row)} & "
-            f"{format_p(row['p_raw'])} & "
-            f"{format_holm(row['p_Holm'])} & "
-            f"{format_rrb(row['r_rb'])} "
-            r"\\"
+        learner_rows = stats[
+            stats[
+                "learner"
+            ].eq(
+                learner
+            )
+        ]
+
+        for environment in ENVIRONMENTS:
+
+            row = learner_rows[
+                learner_rows[
+                    "environment"
+                ].eq(
+                    environment
+                )
+            ]
+
+            if len(row) != 1:
+
+                raise RuntimeError(
+                    "Expected exactly one row for "
+                    f"{learner}, {environment}"
+                )
+
+            row = row.iloc[
+                0
+            ]
+
+            latex_row = (
+                f"{learner} & "
+                f"{environment} &\n"
+                f"{format_effect(row)} &\n"
+                f"{format_wtl(row)} & "
+                f"{format_p(row['p_raw'])} & "
+                f"{format_holm(row['p_Holm'])} & "
+                f"{format_rrb(row['r_rb'])} "
+                r"\\"
+            )
+
+            lines.append(
+                latex_row
+            )
+
+            lines.append(
+                ""
+            )
+
+    return (
+        "\n".join(
+            lines
         )
-
-        lines.append(
-            latex_row
-        )
-
-        lines.append("")
-
-
-latex_body = (
-    "\n".join(lines)
-    .rstrip()
-)
+        .rstrip()
+    )
 
 
 # ============================================================
-# Save LaTeX body
+# Main
 # ============================================================
 
-Path(
-    OUTPUT_LATEX
-).write_text(
-    latex_body + "\n",
-    encoding="utf-8"
-)
+def main():
+
+    # --------------------------------------------------------
+    # Load original held-out episode-level data
+    # --------------------------------------------------------
+
+    print(
+        "Loading PPO held-out evaluations..."
+    )
+
+    ppo = read_episode_file(
+        PPO_HELDOUT,
+        learner="PPO",
+    )
+
+    print(
+        "Loading SAC held-out evaluations..."
+    )
+
+    sac = read_episode_file(
+        SAC_HELDOUT,
+        learner="SAC",
+    )
+
+    episodes = pd.concat(
+        [
+            ppo,
+            sac,
+        ],
+        ignore_index=True,
+    )
+
+    episodes = (
+        validate_episode_level_data(
+            episodes
+        )
+    )
+
+    # --------------------------------------------------------
+    # Seed-level held-out outcomes
+    # --------------------------------------------------------
+
+    seed_level = (
+        compute_seed_level_results(
+            episodes
+        )
+    )
+
+    seed_counts = (
+        validate_training_seed_counts(
+            seed_level
+        )
+    )
+
+    print(
+        "\nTraining seeds per learner/method/environment:"
+    )
+
+    print(
+        seed_counts.to_string(
+            index=False
+        )
+    )
+
+    # --------------------------------------------------------
+    # Save seed-level data
+    # --------------------------------------------------------
+
+    seed_level.to_csv(
+        OUTPUT_SEED_LEVEL,
+        index=False,
+    )
+
+    # --------------------------------------------------------
+    # Build all matched CODA-PB2 seed differences
+    # --------------------------------------------------------
+
+    paired_frames = []
+
+    for learner in LEARNERS:
+
+        for environment in ENVIRONMENTS:
+
+            paired_frames.append(
+                paired_seed_data(
+                    seed_level,
+                    learner,
+                    environment,
+                )
+            )
+
+    paired_all = pd.concat(
+        paired_frames,
+        ignore_index=True,
+    )
+
+    paired_all.to_csv(
+        OUTPUT_PAIRED,
+        index=False,
+    )
+
+    # --------------------------------------------------------
+    # Compute primary statistical family
+    # --------------------------------------------------------
+
+    stats = (
+        compute_primary_stats(
+            paired_all
+        )
+    )
+
+    stats.to_csv(
+        OUTPUT_STATS,
+        index=False,
+    )
+
+    # --------------------------------------------------------
+    # Generate LaTeX table body
+    # --------------------------------------------------------
+
+    latex_body = (
+        build_latex_body(
+            stats
+        )
+    )
+
+    OUTPUT_LATEX.write_text(
+        latex_body
+        + "\n",
+        encoding="utf-8",
+    )
+
+    # --------------------------------------------------------
+    # Console report
+    # --------------------------------------------------------
+
+    print(
+        "\n"
+        + "=" * 88
+    )
+
+    print(
+        "PRIMARY CODA vs PB2"
+    )
+
+    print(
+        "=" * 88
+    )
+
+    print(
+        stats.to_string(
+            index=False
+        )
+    )
+
+    print(
+        "\nSciPy version:",
+        scipy.__version__,
+    )
+
+    print(
+        "Wilcoxon: exact, two-sided, "
+        "zero_method='wilcox', "
+        "correction=False"
+    )
+
+    print(
+        f"Bootstrap: N={N_BOOT}, "
+        "percentile 95% CI, "
+        f"seed={BOOT_SEED}"
+    )
+
+    print(
+        "Holm family: 8 primary "
+        "learner-environment comparisons"
+    )
+
+    print(
+        "\n"
+        + "=" * 88
+    )
+
+    print(
+        "LATEX TABLE BODY"
+    )
+
+    print(
+        "=" * 88
+        + "\n"
+    )
+
+    print(
+        latex_body
+    )
+
+    # --------------------------------------------------------
+    # Report generated files
+    # --------------------------------------------------------
+
+    print(
+        "\nGenerated outputs:"
+    )
+
+    print(
+        f"  Seed-level outcomes : {OUTPUT_SEED_LEVEL}"
+    )
+
+    print(
+        f"  Paired differences  : {OUTPUT_PAIRED}"
+    )
+
+    print(
+        f"  Primary statistics  : {OUTPUT_STATS}"
+    )
+
+    print(
+        f"  LaTeX table body    : {OUTPUT_LATEX}"
+    )
+
+    print(
+        "\nDone."
+    )
 
 
-print(
-    "\n"
-    + "=" * 80
-)
+# ============================================================
+# Entry point
+# ============================================================
 
-print(
-    "LATEX TABLE BODY"
-)
-
-print(
-    "=" * 80
-    + "\n"
-)
-
-print(
-    latex_body
-)
-
-print(
-    "\nGenerated files:"
-)
-
-print(
-    f"  {OUTPUT_SEED_LEVEL}"
-)
-
-print(
-    f"  {OUTPUT_PAIRED}"
-)
-
-print(
-    f"  {OUTPUT_STATS}"
-)
-
-print(
-    f"  {OUTPUT_LATEX}"
-)
+if __name__ == "__main__":
+    main()

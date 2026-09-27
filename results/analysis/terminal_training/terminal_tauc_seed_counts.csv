@@ -1,0 +1,17 @@
+learner,method,environment,n_training_seeds
+PPO,CODA,HalfCheetah-v5,10
+PPO,CODA,Hopper-v5,10
+PPO,CODA,Swimmer-v5,10
+PPO,CODA,Walker2d-v5,10
+PPO,PB2,HalfCheetah-v5,10
+PPO,PB2,Hopper-v5,10
+PPO,PB2,Swimmer-v5,10
+PPO,PB2,Walker2d-v5,10
+SAC,CODA,HalfCheetah-v5,10
+SAC,CODA,Hopper-v5,10
+SAC,CODA,Swimmer-v5,10
+SAC,CODA,Walker2d-v5,10
+SAC,PB2,HalfCheetah-v5,10
+SAC,PB2,Hopper-v5,10
+SAC,PB2,Swimmer-v5,10
+SAC,PB2,Walker2d-v5,10

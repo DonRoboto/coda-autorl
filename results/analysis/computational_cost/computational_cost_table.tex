@@ -1,0 +1,33 @@
+\begin{table*}[!t]
+\centering
+\caption{Computational and interaction cost of the HPO procedures. Panel A reports aggregate trial execution time normalized by total sampled interactions (seconds per $10^5$ environment interactions). Panel B reports total sampled environment interactions across all trials participating in the HPO run, in millions. Values are median $[Q_1,Q_3]$ across training seeds.}
+\label{tab:computational-cost}
+\footnotesize
+\setlength{\tabcolsep}{5.2pt}
+\renewcommand{\arraystretch}{1.10}
+\begin{tabular}{@{}llcccc@{}}
+\toprule
+\textbf{Learner} & \textbf{Environment} & \textbf{PBT} & \textbf{PB2} & \textbf{ASHA} & \textbf{CODA} \\
+\midrule
+\multicolumn{6}{l}{\textit{Panel A: Compute time per $10^5$ sampled interactions (s)}} \\[1pt]
+PPO & HalfCheetah-v5 & 22.9 [22.7, 23.1] & 22.2 [21.8, 22.9] & 22.0 [21.7, 22.3] & 23.5 [23.1, 23.6] \\
+PPO & Hopper-v5 & 24.6 [24.6, 25.0] & 23.4 [23.2, 23.7] & 24.4 [24.1, 24.9] & 25.6 [24.9, 25.8] \\
+PPO & Swimmer-v5 & 23.3 [23.1, 23.4] & 22.7 [22.2, 23.4] & 23.2 [23.0, 23.4] & 23.9 [23.1, 24.5] \\
+PPO & Walker2d-v5 & 25.8 [25.1, 26.0] & 25.0 [24.8, 25.2] & 24.4 [24.2, 25.1] & 26.1 [26.0, 26.3] \\
+SAC & HalfCheetah-v5 & 127.7 [127.5, 129.7] & 129.2 [128.1, 131.3] & 121.0 [119.9, 123.9] & 135.1 [134.0, 137.6] \\
+SAC & Hopper-v5 & 130.9 [130.4, 132.6] & 130.0 [129.7, 131.1] & 126.8 [125.2, 129.4] & 137.8 [136.9, 138.2] \\
+SAC & Swimmer-v5 & 128.3 [127.7, 131.6] & 135.5 [133.5, 137.9] & 123.1 [122.4, 126.2] & 132.7 [131.2, 133.5] \\
+SAC & Walker2d-v5 & 129.8 [128.8, 134.0] & 133.6 [131.7, 136.6] & 127.1 [126.0, 128.2] & 137.4 [133.2, 138.1] \\
+\midrule
+\multicolumn{6}{l}{\textit{Panel B: Total sampled environment interactions (million)}} \\[1pt]
+PPO & HalfCheetah-v5 & 8.04 [8.02, 8.05] & 8.05 [8.04, 8.07] & 12.79 [10.30, 14.55] & 8.06 [8.03, 8.06] \\
+PPO & Hopper-v5 & 8.06 [8.05, 8.06] & 8.05 [8.04, 8.06] & 8.62 [6.13, 13.25] & 8.07 [8.05, 8.08] \\
+PPO & Swimmer-v5 & 8.03 [8.02, 8.04] & 8.04 [8.02, 8.07] & 8.97 [8.29, 9.36] & 8.06 [8.03, 8.08] \\
+PPO & Walker2d-v5 & 8.05 [8.04, 8.06] & 8.05 [8.05, 8.09] & 10.52 [8.13, 13.14] & 8.07 [8.05, 8.09] \\
+SAC & HalfCheetah-v5 & 4.01 [4.01, 4.01] & 4.01 [4.01, 4.01] & 2.96 [2.18, 3.37] & 4.01 [4.01, 4.01] \\
+SAC & Hopper-v5 & 4.01 [4.01, 4.01] & 4.01 [4.01, 4.01] & 3.77 [2.80, 4.21] & 4.01 [4.01, 4.01] \\
+SAC & Swimmer-v5 & 4.01 [4.01, 4.01] & 4.01 [4.01, 4.01] & 3.02 [2.59, 3.81] & 4.01 [4.01, 4.01] \\
+SAC & Walker2d-v5 & 4.01 [4.01, 4.01] & 4.01 [4.01, 4.01] & 3.52 [3.02, 4.68] & 4.01 [4.01, 4.01] \\
+\bottomrule
+\end{tabular}
+\end{table*}

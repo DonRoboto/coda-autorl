@@ -1,0 +1,9 @@
+learner,environment,n_training_seeds
+PPO,HalfCheetah-v5,10
+PPO,Hopper-v5,10
+PPO,Swimmer-v5,10
+PPO,Walker2d-v5,10
+SAC,HalfCheetah-v5,10
+SAC,Hopper-v5,10
+SAC,Swimmer-v5,10
+SAC,Walker2d-v5,10
