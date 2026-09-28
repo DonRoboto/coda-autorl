@@ -1,0 +1,22 @@
+\begin{table*}[t]
+\centering
+\caption{Full-CODA operational activity, reported as median $[Q_1,Q_3]$ across ten seeds. O2I near-maximal activity denotes the within-seed fraction of active events with $U_t^{\mathrm{eff}}\geq0.95$; history-envelope activity denotes the fraction satisfying $|U_t^{\mathrm{eff}}-\omega_t|\leq0.01$. I2O statistics use genuine learner reports.}
+\label{tab:channel_activity}
+\setlength{\tabcolsep}{3.2pt}
+\renewcommand{\arraystretch}{1.05}
+\begin{tabular}{llcccccc}
+\hline
+Learner & Environment & O2I active & Near-max & Hist.-env. & I2O valid & Median $S$ & $S\geq0.95$ \\
+ & & (\%) & (\%) & (\%) & (\%) & & (\%) \\
+\hline
+PPO & HalfCheetah-v5 & 91.7 [84.7, 93.9] & 60.4 [56.5, 66.1] & 100.0 [91.8, 100.0] & 100.0 [100.0, 100.0] & 0.718 [0.672, 0.758] & 11.8 [9.9, 22.5] \\
+PPO & Hopper-v5 & 94.6 [91.1, 94.7] & 61.0 [55.0, 70.7] & 100.0 [95.0, 100.0] & 100.0 [100.0, 100.0] & 0.860 [0.839, 0.899] & 27.0 [15.3, 37.3] \\
+PPO & Swimmer-v5 & 89.4 [83.2, 94.5] & 59.5 [55.1, 65.4] & 93.1 [86.0, 95.0] & 100.0 [100.0, 100.0] & 0.812 [0.730, 0.855] & 14.9 [8.1, 26.9] \\
+PPO & Walker2d-v5 & 90.0 [87.6, 90.8] & 56.3 [53.6, 61.9] & 94.4 [86.3, 100.0] & 100.0 [100.0, 100.0] & 0.735 [0.643, 0.764] & 16.3 [10.1, 30.9] \\
+SAC & HalfCheetah-v5 & 86.2 [82.6, 90.4] & 13.4 [8.5, 18.8] & 80.1 [75.5, 96.4] & 100.0 [100.0, 100.0] & 0.964 [0.959, 0.971] & 61.5 [57.1, 65.9] \\
+SAC & Hopper-v5 & 78.9 [75.0, 84.3] & 11.1 [9.3, 15.3] & 100.0 [90.2, 100.0] & 100.0 [100.0, 100.0] & 0.959 [0.949, 0.966] & 54.6 [49.7, 56.0] \\
+SAC & Swimmer-v5 & 81.7 [77.4, 85.4] & 19.1 [17.0, 22.3] & 85.5 [75.0, 100.0] & 100.0 [100.0, 100.0] & 0.992 [0.991, 0.994] & 81.2 [78.6, 82.3] \\
+SAC & Walker2d-v5 & 79.3 [66.7, 81.2] & 18.2 [13.2, 22.3] & 100.0 [100.0, 100.0] & 100.0 [100.0, 100.0] & 0.924 [0.895, 0.941] & 40.1 [33.3, 48.0] \\
+\hline
+\end{tabular}
+\end{table*}
