@@ -400,23 +400,6 @@ Implementation components are under:
 src/coda/
 ```
 
----
-
-## Recommended release procedure
-
-Before creating the public artifact release:
-
-1. Ensure all standardized analysis scripts use the same archive naming
-   convention.
-2. Run every paper-analysis script from the repository root.
-3. Confirm that `results/analysis/` contains the expected generated artifacts.
-4. Remove `__pycache__/`, `*.pyc`, local virtual environments, and transient Ray
-   output directories.
-5. Do not include the repository's internal `.git/` directory in a supplementary
-   ZIP archive.
-6. Commit the exact release state and create a version tag.
-7. If possible, archive the release on a service that provides a persistent DOI
-   and cite that release in the manuscript.
 
 ---
 
