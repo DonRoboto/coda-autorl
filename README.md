@@ -357,8 +357,7 @@ Therefore:
 - the provided evaluation scripts document the evaluation procedure;
 - exact policy reevaluation requires the corresponding original checkpoints.
 
-If checkpoints are released separately (for example through an archival data
-repository), add the persistent archive URL and checksum information here.
+
 
 ---
 
